@@ -1,0 +1,10 @@
+optuna
+pandas
+numpy
+tqdm
+catboost
+scikit-learn
+compress-fasttext
+pyarrow
+matplotlib
+seaborn
