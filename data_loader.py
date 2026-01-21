@@ -55,12 +55,24 @@ def p90_non_null(x: pd.Series):
 def aggregate_alerts(alerts: pd.DataFrame) -> pd.DataFrame:
     print("Aggregating alerts...")
 
+    dirty_cols = [
+        "single_alert_backfill_record_total_backfills_failed",
+        "single_alert_backfill_record_total_backfills_successful"
+    ]
+
+    for c in dirty_cols:
+        if c in alerts.columns:
+            alerts[c] = pd.to_numeric(
+                alerts[c].astype(str).str.replace(r'[(),]', '', regex=True),
+                errors='coerce'
+            ).fillna(0.0)
+
     single_num_candidates = [
         "single_alert_amount_abs",
         "single_alert_amount_pct",
         "single_alert_prev_value",
         "single_alert_new_value",
-        "single_alert_t_value",
+        # "single_alert_t_value",
     ]
 
     single_cat_candidates = [
@@ -74,6 +86,9 @@ def aggregate_alerts(alerts: pd.DataFrame) -> pd.DataFrame:
         "single_alert_series_signature_machine_platform",
         "single_alert_series_signature_measurement_unit",
         "single_alert_series_signature_lower_is_better",
+        "single_alert_series_signature_extra_options",
+        "single_alert_classifier",
+        "single_alert_series_signature_has_subtests",
     ]
 
     summary_cols_candidates = [
@@ -85,10 +100,11 @@ def aggregate_alerts(alerts: pd.DataFrame) -> pd.DataFrame:
         "alert_summary_prev_push_id",
         "alert_summary_prev_push_revision",
         "alert_summary_framework",
-        "alert_summary_issue_tracker",
+        #"alert_summary_issue_tracker",
         "alert_summary_related_alerts",
         "alert_summary_triage_due_date",
         "alert_summary_notes",
+        "alert_summary_performance_tags",
     ]
 
     available_summary_cols = [c for c in summary_cols_candidates if c in alerts.columns]
@@ -106,8 +122,8 @@ def aggregate_alerts(alerts: pd.DataFrame) -> pd.DataFrame:
     for c in available_single_num:
         agg_spec[f"{c}__mean"] = pd.NamedAgg(column=c, aggfunc="mean")
         agg_spec[f"{c}__max"] = pd.NamedAgg(column=c, aggfunc="max")
-        agg_spec[f"{c}__min"] = pd.NamedAgg(column=c, aggfunc="min")  # Manquait dans le refactor
-        agg_spec[f"{c}__std"] = pd.NamedAgg(column=c, aggfunc="std")  # Manquait dans le refactor
+        agg_spec[f"{c}__min"] = pd.NamedAgg(column=c, aggfunc="min")
+        agg_spec[f"{c}__std"] = pd.NamedAgg(column=c, aggfunc="std")
         agg_spec[f"{c}__p90"] = pd.NamedAgg(column=c, aggfunc=p90_non_null)
 
     for c in available_single_cat:
@@ -132,12 +148,12 @@ def aggregate_alerts(alerts: pd.DataFrame) -> pd.DataFrame:
         ts = pd.to_datetime(summary_df["push_timestamp"], errors="coerce", utc=True)
         summary_df["push_dow"] = ts.dt.dayofweek
         summary_df["push_hour"] = ts.dt.hour
-        summary_df["push_is_weekend"] = ts.dt.dayofweek.isin([5, 6]).astype("int8") # Manquait
+        summary_df["push_is_weekend"] = ts.dt.dayofweek.isin([5, 6]).astype("int8")
 
     if "alert_summary_notes" in summary_df.columns:
         notes = summary_df["alert_summary_notes"].fillna("").astype(str)
-        summary_df["notes_len_chars"] = notes.str.len() # Manquait
-        summary_df["notes_len_words"] = notes.str.split().str.len() # Manquait
+        summary_df["notes_len_chars"] = notes.str.len()
+        summary_df["notes_len_words"] = notes.str.split().str.len()
 
     print(f"Aggregation ok. Shape: {summary_df.shape}")
     return summary_df

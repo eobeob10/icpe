@@ -169,7 +169,7 @@ def _process_single_row(args):
 def enrich_with_ts_features(summary_df: pd.DataFrame, alerts_raw: pd.DataFrame) -> pd.DataFrame:
     cache_dir = Path("./derived_features")
     cache_dir.mkdir(parents=True, exist_ok=True)
-    cache_file = cache_dir / "ts_features_multiscale_v2.parquet"  # Changé nom fichier pour forcer update
+    cache_file = cache_dir / "ts_features_multiscale_v2.parquet"
 
     if cache_file.exists():
         print(f"Loading cached TS features from {cache_file}")

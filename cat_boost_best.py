@@ -1,7 +1,6 @@
 import optuna
 import pandas as pd
 import numpy as np
-from tqdm import tqdm
 from catboost import CatBoostClassifier, Pool
 from sklearn.metrics import average_precision_score
 from sklearn.decomposition import PCA
@@ -9,106 +8,16 @@ from sklearn.model_selection import RepeatedStratifiedKFold
 from data_loader import load_raw_data, aggregate_alerts
 from timeseries_multi import enrich_with_ts_features
 from config import TRAIN_CONFIG
-import compress_fasttext
+from preprocessing import perform_time_split, enrich_and_weight_data, get_embeddings, engineer_complex_features
 
 DB_URL = f"sqlite:///optuna_icpe_fasttext-compressed_preprocessing.db"
 STUDY_NAME = f"catboost_hybrid_v1_fasttext-compressed_preprocessing"
-N_TRIALS = 1000
-N_SPLITS = 5
-N_REPEATS = 2
+N_TRIALS = 500
+N_SPLITS = 3
+N_REPEATS = 1
 
 BATCH_SIZE = TRAIN_CONFIG.get("batch_size_eval", 32)
 
-
-def get_embeddings(text_list):
-    print(f"DL FastText")
-    small_model = compress_fasttext.models.CompressedFastTextKeyedVectors.load(
-        'https://github.com/avidale/compress-fasttext/releases/download/v0.0.4/cc.en.300.compressed.bin'
-    )
-
-    embeddings = []
-    for text in tqdm(text_list):
-        if pd.isna(text) or str(text).strip() == "":
-            embeddings.append(np.zeros(600))
-        else:
-            tokens = str(text).split()
-            if not tokens:
-                embeddings.append(np.zeros(600))
-                continue
-
-            word_vecs = [small_model[word] for word in tokens]
-            sent_vec = np.concatenate([
-                np.mean(word_vecs, axis=0),
-                np.max(word_vecs, axis=0)
-            ])
-            embeddings.append(sent_vec)
-
-    return np.vstack(embeddings).astype(np.float32)
-
-def perform_time_split(df):
-    time_col = "push_timestamp" if "push_timestamp" in df.columns else "alert_summary_creation_timestamp"
-    df = df.sort_values(time_col).reset_index(drop=True)
-
-    n = len(df)
-    n_test = int(n * TRAIN_CONFIG["test_frac"])
-    n_train_val = n - n_test
-
-    train_val = df.iloc[:n_train_val].copy().reset_index(drop=True)
-    test = df.iloc[n_train_val:].copy().reset_index(drop=True)
-
-    return train_val, test
-
-
-def enrich_and_weight_data(df_alerts, df_bugs):
-    if 'id' in df_bugs.columns and 'bug_id' not in df_bugs.columns:
-        df_bugs = df_bugs.rename(columns={'id': 'bug_id'})
-
-    if df_alerts["push_timestamp"].dtype == 'object':
-        df_alerts["push_timestamp"] = pd.to_datetime(df_alerts["push_timestamp"])
-
-    df_alerts['is_weekend'] = (df_alerts['push_timestamp'].dt.dayofweek >= 5).astype(int)
-
-    df_alerts['hour_sin'] = np.sin(2 * np.pi * df_alerts['push_timestamp'].dt.hour / 24)
-    df_alerts['hour_cos'] = np.cos(2 * np.pi * df_alerts['push_timestamp'].dt.hour / 24)
-
-    df_alerts = df_alerts.sort_values("push_timestamp")
-    time_diff = df_alerts["push_timestamp"].diff().dt.total_seconds().fillna(3600)
-    df_alerts['log_time_since_last_push'] = np.log1p(time_diff)
-
-    if 'priority' in df_bugs.columns:
-        prio_map = {
-            'P1': 10.0,
-            'P2': 5.0,
-            'P3': 2.0,
-            '--': 1.0,  # default
-            'CRITICAL': 10.0,
-            'MAJOR': 5.0
-        }
-
-        df_merged = df_alerts.merge(
-            df_bugs[['bug_id', 'priority']],
-            on='bug_id',
-            how='left'
-        )
-
-        df_merged['priority'] = df_merged['priority'].fillna('--')
-
-        def get_weight(row):
-            if row['bug_created'] == 0:
-                return 1.0
-
-            p_str = str(row['priority']).strip().upper()
-            return prio_map.get(p_str, 1.0)
-
-        df_alerts['sample_weight'] = df_merged.apply(get_weight, axis=1)
-
-        print(f"Distribution des poids (Top 5):\n{df_alerts['sample_weight'].value_counts().head()}")
-
-    else:
-        print("WARNING priority not found")
-        df_alerts['sample_weight'] = 1.0
-
-    return df_alerts
 
 def prepare_data():
     print("--- 1. Chargement & Engineering ---")
@@ -116,6 +25,9 @@ def prepare_data():
     df = aggregate_alerts(alerts)
 
     df = enrich_and_weight_data(df, bugs)
+
+    df = engineer_complex_features(df)
+
     df = enrich_with_ts_features(df, alerts)
     df["bug_created"] = df["bug_created"].fillna(0).astype(int)
 
@@ -138,17 +50,17 @@ print(f"Data Ready: Train+Val={len(TRAIN_VAL_DF)}, Test={len(TEST_DF)}")
 
 
 def objective(trial):
+    grow_policy = trial.suggest_categorical("grow_policy", ["SymmetricTree", "Depthwise", "Lossguide"])
+
     params = {
         "iterations": 2000,
-        "learning_rate": trial.suggest_float("learning_rate", 1e-4, 0.3, log=True),
+        "learning_rate": trial.suggest_float("learning_rate", 0.005, 0.3, log=True),
         "depth": trial.suggest_int("depth", 4, 10),
-        "l2_leaf_reg": trial.suggest_float("l2_leaf_reg", 1e-1, 10, log=True),
-        "random_strength": trial.suggest_float("random_strength", 1e-9, 10, log=True),
-        "bagging_temperature": trial.suggest_float("bagging_temperature", 0.0, 1.0),
+        "l2_leaf_reg": trial.suggest_float("l2_leaf_reg", 1e-1, 20, log=True),
         "border_count": trial.suggest_categorical("border_count", [32, 64, 128, 254]),
-        "min_data_in_leaf": trial.suggest_int("min_data_in_leaf", 1, 50),
-        "scale_pos_weight": trial.suggest_float("scale_pos_weight", 1.0, 10.0),
-        "grow_policy": trial.suggest_categorical("grow_policy", ["SymmetricTree", "Depthwise", "Lossguide"]),
+        "min_data_in_leaf": trial.suggest_int("min_data_in_leaf", 1, 100),
+        "scale_pos_weight": trial.suggest_float("scale_pos_weight", 1.0, 50.0, log=True),
+        "grow_policy": grow_policy,
         "eval_metric": "AUC",
         "early_stopping_rounds": 100,
         "verbose": 0,
@@ -156,11 +68,46 @@ def objective(trial):
         "thread_count": 4
     }
 
+    if grow_policy == "Lossguide":
+        params["max_leaves"] = trial.suggest_int("max_leaves", 16, 64)
+
+    bootstrap_type = trial.suggest_categorical("bootstrap_type", ["Bayesian", "Bernoulli", "MVS"])
+    params["bootstrap_type"] = bootstrap_type
+
+    if bootstrap_type == "Bayesian":
+        params["bagging_temperature"] = trial.suggest_float("bagging_temperature", 0.0, 10.0)
+    elif bootstrap_type in ["Bernoulli", "MVS"]:
+        params["subsample"] = trial.suggest_float("subsample", 0.1, 1.0)
+
+    params["one_hot_max_size"] = trial.suggest_categorical("one_hot_max_size", [2, 10, 50])
     pca_n = trial.suggest_int("pca_components", 20, 600)
 
     target_col = "bug_created"
 
-    ignore_cols = ["bug_id", "alert_summary_id", target_col, "alert_summary_notes"]
+    ignore_cols = [
+            "bug_id", "alert_summary_id", target_col, "alert_summary_notes",
+            "push_timestamp", "alert_summary_creation_timestamp", "sample_weight",
+            "seconds_since_last_push"  # On ignore la feature brute, on garde le log,
+            # Dates techniques inutilisables
+            'alert_summary_triage_due_date',
+            'alert_summary_bug_due_date',
+            'alert_summary_bug_updated',  # Souvent présent, fuite possible
+
+            # Identifiants uniques (Bruit / Overfitting)
+            'alert_summary_push_id',
+            'alert_summary_prev_push_id',
+            'alert_summary_revision',
+            'alert_summary_prev_push_revision',
+            'single_alert_series_signature_signature_hash__mode',
+            'single_alert_series_signature_option_collection_hash__mode',
+
+            # Constantes ou ID internes
+            'alert_summary_issue_tracker',
+            'single_alert_id__min',
+            'single_alert_id__max',
+            'single_alert_summary_id__mode'
+        ]
+
 
     features_static = [c for c in TRAIN_VAL_DF.columns if c not in ignore_cols]
 
@@ -182,8 +129,8 @@ def objective(trial):
         X_train_stat, X_val_stat = X_static.iloc[train_idx], X_static.iloc[val_idx]
         y_train_f, y_val_f = y.iloc[train_idx], y.iloc[val_idx]
 
-        w_train = X_train_stat['sample_weight']
-        w_val = X_val_stat['sample_weight']
+        w_train = df_static['sample_weight'].iloc[train_idx]
+        w_val = df_static['sample_weight'].iloc[val_idx]
 
         emb_train = TRAIN_VAL_EMBS[train_idx]
         emb_val = TRAIN_VAL_EMBS[val_idx]
@@ -197,11 +144,11 @@ def objective(trial):
         X_train_final = pd.concat([X_train_stat, df_train_pca], axis=1)
         X_val_final = pd.concat([X_val_stat, df_val_pca], axis=1)
 
-        X_train_clean = X_train_final.drop(columns=['sample_weight'])
-        X_val_clean = X_val_final.drop(columns=['sample_weight'])
+        #X_train_clean = X_train_final.drop(columns=['sample_weight'])
+        #X_val_clean = X_val_final.drop(columns=['sample_weight'])
 
-        train_pool = Pool(X_train_clean, label=y_train_f, weight=w_train, cat_features=cat_cols_static)
-        val_pool = Pool(X_val_clean, label=y_val_f, weight=w_val, cat_features=cat_cols_static)
+        train_pool = Pool(X_train_final, label=y_train_f, weight=w_train, cat_features=cat_cols_static)
+        val_pool = Pool(X_val_final, label=y_val_f, weight=w_val, cat_features=cat_cols_static)
 
         model = CatBoostClassifier(**params)
         model.fit(train_pool, eval_set=val_pool)

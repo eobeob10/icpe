@@ -10,13 +10,11 @@ import seaborn as sns
 from catboost import CatBoostClassifier, Pool
 from sklearn.metrics import average_precision_score
 from sklearn.decomposition import PCA
-from tqdm import tqdm
-
-# Imports de tes modules
 from data_loader import load_raw_data, aggregate_alerts
 from timeseries_multi import enrich_with_ts_features
-from config import TRAIN_CONFIG
-import compress_fasttext
+from cleanlab.filter import find_label_issues
+from preprocessing import perform_time_split, enrich_and_weight_data, get_embeddings, engineer_complex_features
+
 
 # --- CONFIGURATION ---
 OUTPUT_DIR = "benchmark_results"
@@ -24,16 +22,18 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # Tes meilleurs paramètres (Hardcoded)
 BEST_PARAMS = {
-    "learning_rate": 0.05121825335140923,
-    "depth": 6,
-    "l2_leaf_reg": 3.5938074222624334,
-    "random_strength": 0.0016127559270012492,
-    "bagging_temperature": 0.5883202468150027,
-    "border_count": 128,
-    "min_data_in_leaf": 19,
-    "scale_pos_weight": 1.2223024563767102,
-    "grow_policy": "SymmetricTree",
-    "pca_components": 161
+    "grow_policy": "Lossguide",
+    "learning_rate": 0.02078155874027329,
+    "depth": 5,
+    "l2_leaf_reg": 5.696201658338176,
+    "border_count": 32,
+    "min_data_in_leaf": 44,
+    "max_leaves": 19,
+    "scale_pos_weight": 1.4399585477497998,
+    "bootstrap_type": "Bernoulli",
+    "subsample": 0.9069303366018339,
+    "one_hot_max_size": 10,
+    "pca_components": 50
 }
 
 
@@ -68,68 +68,6 @@ class ResourceMonitor(threading.Thread):
         return pd.DataFrame(self.records)
 
 
-# --- FONCTIONS UTILITAIRES ---
-def get_embeddings(text_list):
-    print(f"   -> Chargement FastText...")
-    small_model = compress_fasttext.models.CompressedFastTextKeyedVectors.load(
-        'https://github.com/avidale/compress-fasttext/releases/download/v0.0.4/cc.en.300.compressed.bin'
-    )
-    embeddings = []
-    print(f"   -> Vectorisation de {len(text_list)} textes...")
-    for text in tqdm(text_list, disable=True):
-        if pd.isna(text) or str(text).strip() == "":
-            embeddings.append(np.zeros(600))
-        else:
-            tokens = str(text).split()
-            if not tokens:
-                embeddings.append(np.zeros(600))
-                continue
-            word_vecs = [small_model[word] for word in tokens]
-            sent_vec = np.concatenate([np.mean(word_vecs, axis=0), np.max(word_vecs, axis=0)])
-            embeddings.append(sent_vec)
-    return np.vstack(embeddings).astype(np.float32)
-
-
-def perform_time_split(df):
-    time_col = "push_timestamp" if "push_timestamp" in df.columns else "alert_summary_creation_timestamp"
-    df = df.sort_values(time_col).reset_index(drop=True)
-    n = len(df)
-    n_test = int(n * TRAIN_CONFIG["test_frac"])
-    n_train_val = n - n_test
-    return df.iloc[:n_train_val].copy().reset_index(drop=True), df.iloc[n_train_val:].copy().reset_index(drop=True)
-
-
-def enrich_and_weight_data(df_alerts, df_bugs):
-    if 'id' in df_bugs.columns and 'bug_id' not in df_bugs.columns:
-        df_bugs = df_bugs.rename(columns={'id': 'bug_id'})
-
-    if df_alerts["push_timestamp"].dtype == 'object':
-        df_alerts["push_timestamp"] = pd.to_datetime(df_alerts["push_timestamp"])
-
-    df_alerts['is_weekend'] = (df_alerts['push_timestamp'].dt.dayofweek >= 5).astype(int)
-    df_alerts['hour_sin'] = np.sin(2 * np.pi * df_alerts['push_timestamp'].dt.hour / 24)
-    df_alerts['hour_cos'] = np.cos(2 * np.pi * df_alerts['push_timestamp'].dt.hour / 24)
-
-    df_alerts = df_alerts.sort_values("push_timestamp")
-    # Feature brute pour le graphique final
-    df_alerts['seconds_since_last_push'] = df_alerts["push_timestamp"].diff().dt.total_seconds().fillna(3600)
-    df_alerts['log_time_since_last_push'] = np.log1p(df_alerts['seconds_since_last_push'])
-
-    if 'priority' in df_bugs.columns:
-        prio_map = {'P1': 10.0, 'P2': 5.0, 'P3': 2.0, '--': 1.0, 'CRITICAL': 10.0, 'MAJOR': 5.0}
-        df_merged = df_alerts.merge(df_bugs[['bug_id', 'priority']], on='bug_id', how='left')
-        df_merged['priority'] = df_merged['priority'].fillna('--')
-
-        def get_weight(row):
-            return 1.0 if row['bug_created'] == 0 else prio_map.get(str(row['priority']).strip().upper(), 1.0)
-
-        df_alerts['sample_weight'] = df_merged.apply(get_weight, axis=1)
-    else:
-        df_alerts['sample_weight'] = 1.0
-
-    return df_alerts
-
-
 # --- MAIN BENCHMARK ---
 def main():
     print("🚀 Démarrage du Benchmark complet (v2)...")
@@ -155,6 +93,8 @@ def main():
 
         # Sauvegarde pour le graph de fin
         time_diff_data = df['seconds_since_last_push'].copy()
+
+        df = engineer_complex_features(df)
 
         timings["1_Load_Data"] = time.time() - t_start
         print(f"   Done in {timings['1_Load_Data']:.2f}s")
@@ -204,7 +144,25 @@ def main():
         ignore_cols = [
             "bug_id", "alert_summary_id", target_col, "alert_summary_notes",
             "push_timestamp", "alert_summary_creation_timestamp", "sample_weight",
-            "seconds_since_last_push"  # On ignore la feature brute, on garde le log
+            "seconds_since_last_push"  # On ignore la feature brute, on garde le log,
+            # Dates techniques inutilisables
+            'alert_summary_triage_due_date',
+            'alert_summary_bug_due_date',
+            'alert_summary_bug_updated',  # Souvent présent, fuite possible
+
+            # Identifiants uniques (Bruit / Overfitting)
+            'alert_summary_push_id',
+            'alert_summary_prev_push_id',
+            'alert_summary_revision',
+            'alert_summary_prev_push_revision',
+            'single_alert_series_signature_signature_hash__mode',
+            'single_alert_series_signature_option_collection_hash__mode',
+
+            # Constantes ou ID internes
+            'alert_summary_issue_tracker',
+            'single_alert_id__min',
+            'single_alert_id__max',
+            'single_alert_summary_id__mode'
         ]
 
         features_static = [c for c in train_val.columns if c not in ignore_cols]
@@ -289,12 +247,156 @@ def main():
             print(f"P@{k}: {p:.4f} | R@{k}: {r:.4f}")
         print("-" * 30)
 
+        # --- ETAPE 8 : ANALYSE DU BRUIT (Cleanlab) ---
+        print("\n[Step 8] Estimating Label Noise (Cleanlab)...")
+        try:
+            # Cleanlab a besoin d'une matrice (N, 2) pour les probas [Proba_0, Proba_1]
+            # probs contient déjà la proba de la classe 1 (Bug)
+            pred_probs = np.column_stack((1 - probs, probs))
+
+            # Détection des erreurs
+            issues = find_label_issues(
+                labels=y_test.values,
+                pred_probs=pred_probs,
+                return_indices_ranked_by='self_confidence'
+            )
+
+            n_issues = len(issues)
+            noise_rate = n_issues / len(y_test)
+
+            print(f"   -> Analyse terminée.")
+            print(f"   -> Labels suspects détectés : {n_issues} sur {len(y_test)} exemples.")
+            print(f"   -> Taux de bruit estimé (Noise Rate) : {noise_rate:.2%}")
+
+            if n_issues > 0:
+                print("\n" + "=" * 60)
+                print("🕵️‍♂️ INSPECTION DÉTAILLÉE DES 5 PREMIERS SUSPECTS")
+                print("=" * 60)
+
+                # On récupère les indices des 5 cas les plus flagrants
+                top_issues_indices = issues[:5]
+
+                # On itère pour afficher les détails
+                for i, idx in enumerate(top_issues_indices):
+                    # On récupère la ligne brute dans le dataframe 'test' (avant transformation)
+                    row = test.iloc[idx]
+                    pred_prob = probs[idx]
+
+                    human_label = int(row['bug_created'])
+                    model_verdict = "BUG" if pred_prob > 0.5 else "PAS BUG"
+                    contradiction = "Faux Positif (Label=0, Modèle=1)" if human_label == 0 else "Faux Négatif (Label=1, Modèle=0)"
+
+                    print(f"\n🔴 SUSPECT #{i + 1} (Indice Test: {idx})")
+                    print(f"   ID                : {row['alert_summary_id']}")
+                    print(f"   CONTRADICTION     : {contradiction}")
+                    print(f"   CONFIDENCE MODÈLE : {pred_prob:.4f} (Le modèle est très sûr de lui)")
+
+                    # 1. Le Texte (Feature NLP) - Souvent la clé de l'énigme
+                    txt = str(row['alert_summary_notes']).replace('\n', ' ').strip()
+                    if len(txt) > 300: txt = txt[:300] + "..."
+                    print(f"   📝 TEXTE           : \"{txt}\"")
+
+                    # 2. Les Features Clés (Top Importance)
+                    print(f"   🔗 RELATED ALERTS  : {row.get('alert_summary_related_alerts', 'N/A')} (Feature #1)")
+                    print(f"   📊 T-VALUE (Mean)  : {row.get('single_alert_t_value__mean', 'N/A')} (Score statistique)")
+                    print(f"   🔧 FRAMEWORK       : {row.get('alert_summary_framework', 'N/A')}")
+
+                print("=" * 60 + "\n")
+
+                # --- ETAPE 9 : ANALYSE SPÉCIFIQUE DES TEXTES MANQUANTS (NAN) ---
+                print("\n" + "=" * 60)
+                print("🧩 ANALYSE DES TEXTES 'NAN' (MISSING NOTES)")
+                print("=" * 60)
+
+                # 1. On isole toutes les lignes où le texte est vide ou NaN
+                # On gère les vrais NaN et les chaines vides ou "nan" string
+                nan_mask = test['alert_summary_notes'].isna() | \
+                           (test['alert_summary_notes'].astype(str).str.lower().str.strip() == 'nan') | \
+                           (test['alert_summary_notes'].astype(str).str.strip() == '')
+
+                nan_rows = test[nan_mask]
+                nan_indices = nan_rows.index
+
+                print(f"Stats sur les textes manquants :")
+                print(
+                    f"   -> Nombre total de lignes 'NaN' dans le Test : {len(nan_rows)} / {len(test)} ({len(nan_rows) / len(test):.1%})")
+
+                if len(nan_rows) > 0:
+                    # On regarde la vérité terrain pour ces lignes
+                    n_bugs_real = nan_rows['bug_created'].sum()
+                    ratio_bugs = n_bugs_real / len(nan_rows)
+
+                    print(f"   -> Parmi ces 'NaN', il y a {n_bugs_real} vrais bugs.")
+                    print(f"   -> Probabilité qu'un 'NaN' soit un bug (Ground Truth) : {ratio_bugs:.1%}")
+
+                    # On regarde ce que le modèle en pense
+                    # probs est un numpy array aligné avec test
+                    # On doit récupérer les probs correspondant aux indices des nan_rows
+                    # Attention: probs est un array, nan_rows est un DataFrame avec potentiellement un index discontinu
+                    # Si 'test' a été reset_index, l'index correspond à la position dans probs.
+                    # Dans benchmark.py, perform_time_split fait un reset_index(drop=True), donc les indices sont alignés [0, N]
+
+                    nan_probs = probs[nan_rows.index]
+                    avg_model_conf = np.mean(nan_probs)
+                    print(f"   -> Confiance moyenne du modèle sur ces lignes : {avg_model_conf:.1%}")
+
+                    print("\n🔍 ÉCHANTILLON DE LIGNES 'NAN' (Vrais Bugs vs Faux Positifs)")
+                    print("-" * 60)
+
+                    # On va afficher quelques cas intéressants
+                    # Cas A : C'est un Bug (Label=1) et le modèle l'a vu (Prob > 0.5) -> Le modèle compense le manque de texte
+                    # Cas B : C'est pas un Bug (Label=0) et le modèle s'est trompé (Prob > 0.5) -> Le manque de texte a piégé le modèle ?
+
+                    # On trie par T-Value décroissante pour voir si c'est le couplage T-Value/Nan qui joue
+                    nan_rows_sorted = nan_rows.sort_values('single_alert_t_value__mean', ascending=False).head(10)
+
+                    for idx, row in nan_rows_sorted.iterrows():
+                        pred_prob = probs[idx]
+                        label = row['bug_created']
+
+                        status = "✅ CORRECT" if (pred_prob > 0.5) == label else "❌ ERREUR"
+                        type_err = ""
+                        if status == "❌ ERREUR":
+                            type_err = "(Faux Positif)" if label == 0 else "(Faux Négatif)"
+
+                        print(
+                            f"ID: {row['alert_summary_id']} | Label: {label} | Pred: {pred_prob:.4f} | {status} {type_err}")
+                        print(
+                            f"   📊 T-Value: {row.get('single_alert_t_value__mean', 'N/A'):.1f} | Related: {row.get('alert_summary_related_alerts', 'N/A')}")
+                        print(f"   🔧 Framework: {row.get('alert_summary_framework', 'N/A')}")
+                        print("-" * 30)
+        except ImportError:
+            print("   ⚠️ Cleanlab n'est pas installé. Lance 'pip install cleanlab' pour activer cette étape.")
+        except Exception as e:
+            print(f"   ⚠️ Erreur lors de l'analyse Cleanlab : {e}")
+
 
     finally:
         monitor.stop()
         monitor.join()
 
     # --- ANALYSE & PLOTS ---
+
+        # AFFICHER LE TEXTE DES IMPORTANCES (C'est ça que je veux voir)
+        print("\n" + "=" * 40)
+        print("       TOP 20 FEATURE IMPORTANCE")
+        print("=" * 40)
+
+        feature_importance = model.get_feature_importance()
+        feature_names = model.feature_names_
+
+        # Créer un DataFrame pour trier
+        fi_df = pd.DataFrame({'feature': feature_names, 'importance': feature_importance})
+        fi_df = fi_df.sort_values(by='importance', ascending=False).head(20)
+
+        print(fi_df.to_string(index=False))
+
+        # Vérification rapide de la nouvelle colonne Z-Score
+        if 'rcd_ctxt_zscore' in df.columns:
+            print("\n--- Stats de rcd_ctxt_zscore ---")
+            print(df['rcd_ctxt_zscore'].describe())
+            print(f"Nombre de 1000.0 exacts : {(df['rcd_ctxt_zscore'] == 1000.0).sum()}")
+
     print("\n[Step 7] Generating Reports...")
 
     # 1. Feature Importance Grouped
@@ -309,6 +411,7 @@ def main():
         pd.DataFrame([{"feature": "Alert Summary Notes (NLP Embedding)", "importance": pca_importance}])
     ], ignore_index=True)
     fi_grouped = fi_grouped.sort_values("importance", ascending=False).head(20)
+
 
     plt.figure(figsize=(10, 8))
     sns.barplot(data=fi_grouped, x="importance", y="feature", color="#4c72b0")
