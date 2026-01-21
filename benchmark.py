@@ -1,43 +1,45 @@
 import time
-import threading
-import psutil
 import os
 import gc
+import threading
+import psutil
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-from catboost import CatBoostClassifier, Pool
-from sklearn.metrics import average_precision_score
-from sklearn.decomposition import PCA
+from contextlib import contextmanager
+from catboost import CatBoostClassifier
+from sklearn.metrics import average_precision_score, precision_recall_curve, confusion_matrix
+from cleanlab.filter import find_label_issues
 from data_loader import load_raw_data, aggregate_alerts
 from timeseries_multi import enrich_with_ts_features
-from cleanlab.filter import find_label_issues
 from preprocessing import perform_time_split, enrich_and_weight_data, get_embeddings, engineer_complex_features
+from model_utils import prepare_matrix_with_pca, make_pool, calculate_pr_at_k
 
-
-# --- CONFIGURATION ---
+# Config
 OUTPUT_DIR = "benchmark_results"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# Tes meilleurs paramètres (Hardcoded)
 BEST_PARAMS = {
-    "grow_policy": "Lossguide",
-    "learning_rate": 0.02078155874027329,
-    "depth": 5,
-    "l2_leaf_reg": 5.696201658338176,
+    "grow_policy": "Depthwise",
+    "learning_rate": 0.009608567895102135,
+    "depth": 7,
+    "l2_leaf_reg": 2.32345478451899,
     "border_count": 32,
-    "min_data_in_leaf": 44,
-    "max_leaves": 19,
-    "scale_pos_weight": 1.4399585477497998,
-    "bootstrap_type": "Bernoulli",
-    "subsample": 0.9069303366018339,
-    "one_hot_max_size": 10,
-    "pca_components": 50
+    "min_data_in_leaf": 54,
+    "scale_pos_weight": 1.1518865052450915,
+    "bootstrap_type": "MVS",
+    "subsample": 0.9581959175648539,
+    "one_hot_max_size": 50,
+    "pca_components": 20,
+    "iterations": 2000,
+    "eval_metric": "AUC",
+    "early_stopping_rounds": 100,
+    "verbose": 100,
+    "task_type": "CPU",
+    "thread_count": 4
 }
 
-
-# --- CLASSE DE MONITORING ---
 class ResourceMonitor(threading.Thread):
     def __init__(self, interval=0.1):
         super().__init__()
@@ -49,451 +51,387 @@ class ResourceMonitor(threading.Thread):
 
     def run(self):
         while not self.stop_event.is_set():
-            current_time = time.time() - self.start_time
-            cpu_pct = psutil.cpu_percent(interval=None)
-            mem_info = self.process.memory_info()
-            ram_mb = mem_info.rss / (1024 * 1024)
-
+            curr = time.time() - self.start_time
             self.records.append({
-                "time": current_time,
-                "cpu": cpu_pct,
-                "ram": ram_mb
+                "time": curr,
+                "cpu": psutil.cpu_percent(interval=None),
+                "ram": self.process.memory_info().rss / (1024 * 1024)
             })
             time.sleep(self.interval)
 
     def stop(self):
         self.stop_event.set()
 
-    def get_dataframe(self):
-        return pd.DataFrame(self.records)
 
+class BenchmarkPipeline:
+    def __init__(self):
+        self.timings = {}
+        self.data = {}
+        self.model = None
+        self.pca_model = None
+        self.cat_cols = []
+        self.probs = None
+        self.monitor = ResourceMonitor()
 
-# --- MAIN BENCHMARK ---
-def main():
-    print("🚀 Démarrage du Benchmark complet (v2)...")
+    @contextmanager
+    def log_step(self, name):
+        print(f"\n[Step] {name}...")
+        t0 = time.time()
+        yield
+        duration = time.time() - t0
+        self.timings[name] = duration
+        print(f"   Done in {duration:.2f}s")
 
-    monitor = ResourceMonitor(interval=0.1)
-    monitor.start()
+    def run(self):
+        print("🚀 Démarrage du Benchmark 'REALISTE' (No Human Notes)...")
+        self.monitor.start()
 
-    timings = {}
-    step_starts = {}  # Pour stocker les timestamps relatifs
-    monitor_start_ts = monitor.start_time
+        try:
+            with self.log_step("1. Loading & Feature Engineering"):
+                self._step_1_loading()
 
-    # Pour le graphique final
-    time_diff_data = None
+            with self.log_step("2. Time Series Extraction"):
+                self._step_2_timeseries()
 
-    try:
-        # --- ETAPE 1 : CHARGEMENT ---
-        t_start = time.time()
-        step_starts["Load"] = t_start - monitor_start_ts
-        print("\n[Step 1] Loading & Basic Engineering...")
+            with self.log_step("3. NLP Embeddings (Technical Context)"):
+                self._step_3_nlp()
+
+            with self.log_step("4. Prep & Splitting"):
+                self._step_4_prep_split()
+
+            with self.log_step("5. Model Training"):
+                self._step_5_training()
+
+            with self.log_step("6. Inference & Evaluation"):
+                self._step_6_evaluation()
+
+            self._step_7_cleanlab_analysis()
+            self._step_8_scientific_reporting()
+            self._step_9_export_errors()
+
+        finally:
+            self.monitor.stop()
+            self.monitor.join()
+            print("\nBenchmark Finished. Cleaning up memory...")
+            self.data.clear()
+            gc.collect()
+
+    def _step_1_loading(self):
         alerts, bugs = load_raw_data()
         df = aggregate_alerts(alerts)
         df = enrich_and_weight_data(df, bugs)
-
-        # Sauvegarde pour le graph de fin
-        time_diff_data = df['seconds_since_last_push'].copy()
-
         df = engineer_complex_features(df)
 
-        timings["1_Load_Data"] = time.time() - t_start
-        print(f"   Done in {timings['1_Load_Data']:.2f}s")
+        self.data['df'] = df
+        self.data['alerts_raw'] = alerts
+        self.data['n_commits'] = df['push_timestamp'].nunique()
 
-        # --- ETAPE 2 : TIME SERIES ---
-        t_start = time.time()
-        step_starts["TS"] = t_start - monitor_start_ts
-        print("\n[Step 2] Time Series Extraction...")
-        df = enrich_with_ts_features(df, alerts)
-        df["bug_created"] = df["bug_created"].fillna(0).astype(int)
-        timings["2_Time_Series"] = time.time() - t_start
-        print(f"   Done in {timings['2_Time_Series']:.2f}s")
+    def _step_2_timeseries(self):
+        self.data['df'] = enrich_with_ts_features(self.data['df'], self.data['alerts_raw'])
+        self.data['df']["bug_created"] = self.data['df']["bug_created"].fillna(0).astype(int)
 
-        # --- ETAPE 3 : NLP ---
-        t_start = time.time()
-        step_starts["NLP"] = t_start - monitor_start_ts
-        print("\n[Step 3] NLP Embeddings (FastText)...")
-        notes = df["alert_summary_notes"].tolist()
-        raw_embeddings = get_embeddings(notes)
-        timings["3_NLP_Embeddings"] = time.time() - t_start
-        print(f"   Done in {timings['3_NLP_Embeddings']:.2f}s")
+    def _step_3_nlp(self):
+        df = self.data['df']
 
-        # --- ETAPE 4 : PREP & PCA ---
-        t_start = time.time()
-        step_starts["PCA"] = t_start - monitor_start_ts
-        print("\n[Step 4] PCA & Splitting...")
+        tech_context = (
+                df['alert_summary_repository'].fillna('').astype(str) + " " +
+                df['alert_summary_framework'].fillna('').astype(str) + " " +
+                df['single_alert_series_signature_suite__mode'].fillna('').astype(str) + " " +
+                df['single_alert_series_signature_test__mode'].fillna('').astype(str)
+        )
 
-        # Split Time
-        train_val, test = perform_time_split(df)
+        tech_context = tech_context.str.replace(r'\s+', ' ', regex=True).str.strip()
+
+        print(f"   -> Embedding source: Technical Context (Ex: '{tech_context.iloc[0]}')")
+        self.data['embeddings'] = get_embeddings(tech_context.tolist())
+
+    def _step_4_prep_split(self):
+        train_val, test = perform_time_split(self.data['df'])
         n_train = len(train_val)
-        emb_train = raw_embeddings[:n_train]
-        emb_test = raw_embeddings[n_train:]
 
-        # Free memory
-        del raw_embeddings
+        emb_train = self.data['embeddings'][:n_train]
+        emb_test = self.data['embeddings'][n_train:]
+
+        del self.data['embeddings']
         gc.collect()
 
-        # PCA
-        best_pca_n = BEST_PARAMS["pca_components"]
-        pca = PCA(n_components=best_pca_n, random_state=42)
-        emb_train_pca = pca.fit_transform(emb_train)
-        emb_test_pca = pca.transform(emb_test)
+        pca_n = BEST_PARAMS["pca_components"]
 
-        pca_cols = [f"pca_{i}" for i in range(best_pca_n)]
+        X_train_full, self.cat_cols, self.pca_model = prepare_matrix_with_pca(
+            train_val, emb_train, n_components=pca_n, is_train=True
+        )
 
-        target_col = "bug_created"
-        ignore_cols = [
-            "bug_id", "alert_summary_id", target_col, "alert_summary_notes",
-            "push_timestamp", "alert_summary_creation_timestamp", "sample_weight",
-            "seconds_since_last_push"  # On ignore la feature brute, on garde le log,
-            # Dates techniques inutilisables
-            'alert_summary_triage_due_date',
-            'alert_summary_bug_due_date',
-            'alert_summary_bug_updated',  # Souvent présent, fuite possible
+        X_test_full, _, _ = prepare_matrix_with_pca(
+            test, emb_test, pca_model=self.pca_model, n_components=pca_n, is_train=False
+        )
 
-            # Identifiants uniques (Bruit / Overfitting)
-            'alert_summary_push_id',
-            'alert_summary_prev_push_id',
-            'alert_summary_revision',
-            'alert_summary_prev_push_revision',
-            'single_alert_series_signature_signature_hash__mode',
-            'single_alert_series_signature_option_collection_hash__mode',
+        self.data['train_val'] = train_val
+        self.data['test'] = test
+        self.data['X_train_full'] = X_train_full
+        self.data['X_test_full'] = X_test_full
 
-            # Constantes ou ID internes
-            'alert_summary_issue_tracker',
-            'single_alert_id__min',
-            'single_alert_id__max',
-            'single_alert_summary_id__mode'
+    def _step_5_training(self):
+        X = self.data['X_train_full']
+        y = self.data['train_val']['bug_created']
+        w = self.data['train_val']['sample_weight']
+
+        split_idx = int(len(X) * 0.90)
+
+        train_pool = make_pool(X.iloc[:split_idx], y.iloc[:split_idx], self.cat_cols, w.iloc[:split_idx])
+        val_pool = make_pool(X.iloc[split_idx:], y.iloc[split_idx:], self.cat_cols, w.iloc[split_idx:])
+
+        params = BEST_PARAMS.copy()
+        del params['pca_components']
+
+        self.model = CatBoostClassifier(**params)
+        self.model.fit(train_pool, eval_set=val_pool)
+
+    def _step_6_evaluation(self):
+        test_pool = make_pool(self.data['X_test_full'], None, self.cat_cols)
+        self.probs = self.model.predict_proba(test_pool)[:, 1]
+
+        y_test = self.data['test']['bug_created']
+        auprc = average_precision_score(y_test, self.probs)
+        print(f"   🏆 FINAL TEST AUPRC (Realistic): {auprc:.4f}")
+
+        print("-" * 40)
+        print(f"{'Metric':<10} | {'Value':<10}")
+        print("-" * 40)
+        for k in [50, 100, 200]:
+            p, r = calculate_pr_at_k(y_test, self.probs, k)
+            print(f"P@{k:<4}     | {p:.4f}")
+            print(f"R@{k:<4}     | {r:.4f}")
+        print("-" * 40)
+
+    def _step_7_cleanlab_analysis(self):
+        print("\n--- Cleanlab Analysis (Suspects Inspection) ---")
+        try:
+            y_test = self.data['test']['bug_created'].values
+            pred_probs = np.column_stack((1 - self.probs, self.probs))
+
+            issues_idx = find_label_issues(labels=y_test, pred_probs=pred_probs,
+                                           return_indices_ranked_by='self_confidence')
+
+            print(f"   Labels suspects détectés : {len(issues_idx)}")
+
+            if len(issues_idx) > 0:
+                print("\n   🔍 TOP 3 SUSPECTS (Z-Score vs Label):")
+                for i, idx in enumerate(issues_idx[:3]):
+                    row = self.data['test'].iloc[idx]
+                    prob = self.probs[idx]
+                    label = int(y_test[idx])
+                    z_score = row.get('rcd_ctxt_zscore', 0.0)
+
+                    print(f"   #{i + 1} [ID {row.get('alert_summary_id')}] Label: {label} vs Pred: {prob:.4f}")
+                    print(
+                        f"      Z-Score: {z_score:.2f} | Suite: {row.get('single_alert_series_signature_suite__mode', 'N/A')}")
+
+        except Exception as e:
+            print(f"   Cleanlab analysis skipped: {e}")
+
+    def _step_8_scientific_reporting(self):
+        print("\n--- Generating Scientific Graphs ---")
+        self._plot_feature_importance_grouped()
+        self._plot_pipeline_latency_waterfall()
+        self._plot_pr_curve()
+        self._plot_confusion_matrix()
+        self._plot_prediction_distribution()
+        print(f"   Graphs saved in {OUTPUT_DIR}")
+
+    def _step_9_export_errors(self):
+        print("\n--- [AUDIT] Exporting Misclassified Instances ---")
+
+        # 1. Récupération des données de Test
+        df_test = self.data['test'].copy()
+        y_true = df_test['bug_created']
+        y_prob = self.probs
+        y_pred = (y_prob > 0.5).astype(int)  # Seuil standard
+
+        # 2. Ajout des prédictions au DataFrame
+        df_test['model_probability'] = y_prob
+        df_test['model_prediction'] = y_pred
+
+        # 3. Filtrage : On ne garde que les erreurs
+        # Error condition: Label != Prediction
+        mask_error = (y_true != y_pred)
+        df_errors = df_test[mask_error].copy()
+
+        # 4. Catégorisation de l'erreur (FP vs FN)
+        # FP = Label 0, Pred 1
+        # FN = Label 1, Pred 0
+        df_errors['error_type'] = df_errors.apply(
+            lambda row: "Faux Positif (Alarme inutile)" if row['model_prediction'] == 1 else "Faux Negatif (Bug raté)",
+            axis=1
+        )
+
+        # 5. Calcul de la "Gravité" de l'erreur (Confidence Gap)
+        # Si c'est un FP avec proba 0.99, c'est une erreur grave.
+        # Si c'est un FN avec proba 0.01, c'est une erreur grave.
+        df_errors['error_severity'] = np.abs(df_errors['model_probability'] - df_errors['bug_created'])
+
+        # 6. Sélection des colonnes utiles pour l'analyse (Contextualisation)
+        # On recrée le "Technical Context" pour que je puisse le lire
+        df_errors['tech_context_str'] = (
+                df_errors['alert_summary_repository'].fillna('').astype(str) + " | " +
+                df_errors['single_alert_series_signature_suite__mode'].fillna('').astype(str) + " | " +
+                df_errors['single_alert_series_signature_test__mode'].fillna('').astype(str)
+        )
+
+        cols_to_export = [
+            'alert_summary_id',
+            'error_type',
+            'model_probability',
+            'error_severity',
+            'tech_context_str',  # Ce que le modèle a "lu"
+            'rcd_ctxt_zscore',  # La métrique principale
+            'n_related_alerts',  # L'heuristique principale
+            'tag_infra',  # Le tag principal
+            'single_alert_prev_value__p90'  # Contexte de valeur
         ]
 
-        features_static = [c for c in train_val.columns if c not in ignore_cols]
-        cat_cols = [c for c in features_static if
-                    (train_val[c].dtype == "object" or train_val[c].dtype.name == "category")]
-
-        X_train_static = train_val[features_static].copy()
-        X_test_static = test[features_static].copy()
-
-        for c in cat_cols:
-            X_train_static[c] = X_train_static[c].fillna("MISSING").astype(str)
-            X_test_static[c] = X_test_static[c].fillna("MISSING").astype(str)
-
-        X_train_full = pd.concat([X_train_static, pd.DataFrame(emb_train_pca, columns=pca_cols, index=train_val.index)],
-                                 axis=1)
-        X_test_full = pd.concat([X_test_static, pd.DataFrame(emb_test_pca, columns=pca_cols, index=test.index)], axis=1)
-
-        y_train = train_val[target_col]
-        y_test = test[target_col]
-        w_train = train_val['sample_weight'] if 'sample_weight' in train_val.columns else None
-
-        timings["4_Prep_PCA"] = time.time() - t_start
-        print(f"   Done in {timings['4_Prep_PCA']:.2f}s")
-
-        # --- ETAPE 5 : TRAINING ---
-        t_start = time.time()
-        step_starts["Train"] = t_start - monitor_start_ts
-        print("\n[Step 5] Training CatBoost...")
-
-        train_params = BEST_PARAMS.copy()
-        del train_params["pca_components"]
-
-        split_idx = int(len(X_train_full) * 0.90)
-        X_tr_int = X_train_full.iloc[:split_idx]
-        y_tr_int = y_train.iloc[:split_idx]
-        w_tr_int = w_train.iloc[:split_idx] if w_train is not None else None
-
-        X_val_int = X_train_full.iloc[split_idx:]
-        y_val_int = y_train.iloc[split_idx:]
-        w_val_int = w_train.iloc[split_idx:] if w_train is not None else None
-
-        train_pool = Pool(X_tr_int, label=y_tr_int, cat_features=cat_cols, weight=w_tr_int)
-        val_pool = Pool(X_val_int, label=y_val_int, cat_features=cat_cols, weight=w_val_int)
-
-        model = CatBoostClassifier(
-            iterations=2000,
-            eval_metric="AUC",
-            early_stopping_rounds=100,
-            verbose=100,
-            task_type="CPU",
-            thread_count=4,
-            **train_params
-        )
-        model.fit(train_pool, eval_set=val_pool)
-
-        timings["5_Training"] = time.time() - t_start
-        print(f"   Done in {timings['5_Training']:.2f}s")
-
-        # --- ETAPE 6 : INFERENCE ---
-        t_start = time.time()
-        step_starts["Infer"] = t_start - monitor_start_ts
-        print("\n[Step 6] Inference on Test Set...")
-
-        test_pool = Pool(X_test_full, cat_features=cat_cols)
-        probs = model.predict_proba(test_pool)[:, 1]
-
-        timings["6_Inference"] = time.time() - t_start
-        print(f"   Done in {timings['6_Inference']:.2f}s")
-
-        final_auprc = average_precision_score(y_test, probs)
-
-        def precision_recall_at_k_local(y_true, y_score, k):
-            k = int(min(k, len(y_true)))
-            idx = np.argsort(-y_score)[:k]
-            y_top = np.array(y_true)[idx]
-            return float(y_top.mean()), float(y_top.sum() / max(1, np.sum(y_true)))
-
-        print(f"   🏆 FINAL AUPRC: {final_auprc:.4f}")
-        print("-" * 30)
-        for k in [50, 100, 200]:
-            p, r = precision_recall_at_k_local(y_test, probs, k)
-            print(f"P@{k}: {p:.4f} | R@{k}: {r:.4f}")
-        print("-" * 30)
-
-        # --- ETAPE 8 : ANALYSE DU BRUIT (Cleanlab) ---
-        print("\n[Step 8] Estimating Label Noise (Cleanlab)...")
-        try:
-            # Cleanlab a besoin d'une matrice (N, 2) pour les probas [Proba_0, Proba_1]
-            # probs contient déjà la proba de la classe 1 (Bug)
-            pred_probs = np.column_stack((1 - probs, probs))
-
-            # Détection des erreurs
-            issues = find_label_issues(
-                labels=y_test.values,
-                pred_probs=pred_probs,
-                return_indices_ranked_by='self_confidence'
-            )
-
-            n_issues = len(issues)
-            noise_rate = n_issues / len(y_test)
-
-            print(f"   -> Analyse terminée.")
-            print(f"   -> Labels suspects détectés : {n_issues} sur {len(y_test)} exemples.")
-            print(f"   -> Taux de bruit estimé (Noise Rate) : {noise_rate:.2%}")
-
-            if n_issues > 0:
-                print("\n" + "=" * 60)
-                print("🕵️‍♂️ INSPECTION DÉTAILLÉE DES 5 PREMIERS SUSPECTS")
-                print("=" * 60)
-
-                # On récupère les indices des 5 cas les plus flagrants
-                top_issues_indices = issues[:5]
-
-                # On itère pour afficher les détails
-                for i, idx in enumerate(top_issues_indices):
-                    # On récupère la ligne brute dans le dataframe 'test' (avant transformation)
-                    row = test.iloc[idx]
-                    pred_prob = probs[idx]
-
-                    human_label = int(row['bug_created'])
-                    model_verdict = "BUG" if pred_prob > 0.5 else "PAS BUG"
-                    contradiction = "Faux Positif (Label=0, Modèle=1)" if human_label == 0 else "Faux Négatif (Label=1, Modèle=0)"
-
-                    print(f"\n🔴 SUSPECT #{i + 1} (Indice Test: {idx})")
-                    print(f"   ID                : {row['alert_summary_id']}")
-                    print(f"   CONTRADICTION     : {contradiction}")
-                    print(f"   CONFIDENCE MODÈLE : {pred_prob:.4f} (Le modèle est très sûr de lui)")
-
-                    # 1. Le Texte (Feature NLP) - Souvent la clé de l'énigme
-                    txt = str(row['alert_summary_notes']).replace('\n', ' ').strip()
-                    if len(txt) > 300: txt = txt[:300] + "..."
-                    print(f"   📝 TEXTE           : \"{txt}\"")
-
-                    # 2. Les Features Clés (Top Importance)
-                    print(f"   🔗 RELATED ALERTS  : {row.get('alert_summary_related_alerts', 'N/A')} (Feature #1)")
-                    print(f"   📊 T-VALUE (Mean)  : {row.get('single_alert_t_value__mean', 'N/A')} (Score statistique)")
-                    print(f"   🔧 FRAMEWORK       : {row.get('alert_summary_framework', 'N/A')}")
-
-                print("=" * 60 + "\n")
-
-                # --- ETAPE 9 : ANALYSE SPÉCIFIQUE DES TEXTES MANQUANTS (NAN) ---
-                print("\n" + "=" * 60)
-                print("🧩 ANALYSE DES TEXTES 'NAN' (MISSING NOTES)")
-                print("=" * 60)
-
-                # 1. On isole toutes les lignes où le texte est vide ou NaN
-                # On gère les vrais NaN et les chaines vides ou "nan" string
-                nan_mask = test['alert_summary_notes'].isna() | \
-                           (test['alert_summary_notes'].astype(str).str.lower().str.strip() == 'nan') | \
-                           (test['alert_summary_notes'].astype(str).str.strip() == '')
-
-                nan_rows = test[nan_mask]
-                nan_indices = nan_rows.index
-
-                print(f"Stats sur les textes manquants :")
-                print(
-                    f"   -> Nombre total de lignes 'NaN' dans le Test : {len(nan_rows)} / {len(test)} ({len(nan_rows) / len(test):.1%})")
-
-                if len(nan_rows) > 0:
-                    # On regarde la vérité terrain pour ces lignes
-                    n_bugs_real = nan_rows['bug_created'].sum()
-                    ratio_bugs = n_bugs_real / len(nan_rows)
-
-                    print(f"   -> Parmi ces 'NaN', il y a {n_bugs_real} vrais bugs.")
-                    print(f"   -> Probabilité qu'un 'NaN' soit un bug (Ground Truth) : {ratio_bugs:.1%}")
-
-                    # On regarde ce que le modèle en pense
-                    # probs est un numpy array aligné avec test
-                    # On doit récupérer les probs correspondant aux indices des nan_rows
-                    # Attention: probs est un array, nan_rows est un DataFrame avec potentiellement un index discontinu
-                    # Si 'test' a été reset_index, l'index correspond à la position dans probs.
-                    # Dans benchmark.py, perform_time_split fait un reset_index(drop=True), donc les indices sont alignés [0, N]
-
-                    nan_probs = probs[nan_rows.index]
-                    avg_model_conf = np.mean(nan_probs)
-                    print(f"   -> Confiance moyenne du modèle sur ces lignes : {avg_model_conf:.1%}")
-
-                    print("\n🔍 ÉCHANTILLON DE LIGNES 'NAN' (Vrais Bugs vs Faux Positifs)")
-                    print("-" * 60)
-
-                    # On va afficher quelques cas intéressants
-                    # Cas A : C'est un Bug (Label=1) et le modèle l'a vu (Prob > 0.5) -> Le modèle compense le manque de texte
-                    # Cas B : C'est pas un Bug (Label=0) et le modèle s'est trompé (Prob > 0.5) -> Le manque de texte a piégé le modèle ?
-
-                    # On trie par T-Value décroissante pour voir si c'est le couplage T-Value/Nan qui joue
-                    nan_rows_sorted = nan_rows.sort_values('single_alert_t_value__mean', ascending=False).head(10)
-
-                    for idx, row in nan_rows_sorted.iterrows():
-                        pred_prob = probs[idx]
-                        label = row['bug_created']
-
-                        status = "✅ CORRECT" if (pred_prob > 0.5) == label else "❌ ERREUR"
-                        type_err = ""
-                        if status == "❌ ERREUR":
-                            type_err = "(Faux Positif)" if label == 0 else "(Faux Négatif)"
-
-                        print(
-                            f"ID: {row['alert_summary_id']} | Label: {label} | Pred: {pred_prob:.4f} | {status} {type_err}")
-                        print(
-                            f"   📊 T-Value: {row.get('single_alert_t_value__mean', 'N/A'):.1f} | Related: {row.get('alert_summary_related_alerts', 'N/A')}")
-                        print(f"   🔧 Framework: {row.get('alert_summary_framework', 'N/A')}")
-                        print("-" * 30)
-        except ImportError:
-            print("   ⚠️ Cleanlab n'est pas installé. Lance 'pip install cleanlab' pour activer cette étape.")
-        except Exception as e:
-            print(f"   ⚠️ Erreur lors de l'analyse Cleanlab : {e}")
-
-
-    finally:
-        monitor.stop()
-        monitor.join()
-
-    # --- ANALYSE & PLOTS ---
-
-        # AFFICHER LE TEXTE DES IMPORTANCES (C'est ça que je veux voir)
-        print("\n" + "=" * 40)
-        print("       TOP 20 FEATURE IMPORTANCE")
-        print("=" * 40)
-
-        feature_importance = model.get_feature_importance()
-        feature_names = model.feature_names_
-
-        # Créer un DataFrame pour trier
-        fi_df = pd.DataFrame({'feature': feature_names, 'importance': feature_importance})
-        fi_df = fi_df.sort_values(by='importance', ascending=False).head(20)
-
-        print(fi_df.to_string(index=False))
-
-        # Vérification rapide de la nouvelle colonne Z-Score
-        if 'rcd_ctxt_zscore' in df.columns:
-            print("\n--- Stats de rcd_ctxt_zscore ---")
-            print(df['rcd_ctxt_zscore'].describe())
-            print(f"Nombre de 1000.0 exacts : {(df['rcd_ctxt_zscore'] == 1000.0).sum()}")
-
-    print("\n[Step 7] Generating Reports...")
-
-    # 1. Feature Importance Grouped
-    print("   -> Feature Importance Plot...")
-    fi = model.get_feature_importance(type="PredictionValuesChange")
-    fi_df = pd.DataFrame({"feature": X_test_full.columns, "importance": fi})
-    pca_mask = fi_df["feature"].str.startswith("pca_")
-    pca_importance = fi_df.loc[pca_mask, "importance"].sum()
-    fi_grouped = fi_df[~pca_mask].copy()
-    fi_grouped = pd.concat([
-        fi_grouped,
-        pd.DataFrame([{"feature": "Alert Summary Notes (NLP Embedding)", "importance": pca_importance}])
-    ], ignore_index=True)
-    fi_grouped = fi_grouped.sort_values("importance", ascending=False).head(20)
-
-
-    plt.figure(figsize=(10, 8))
-    sns.barplot(data=fi_grouped, x="importance", y="feature", color="#4c72b0")
-    plt.title("Top 20 Features (With NLP Grouped)")
-    plt.tight_layout()
-    plt.savefig(os.path.join(OUTPUT_DIR, "feature_importance_grouped.png"))
-    plt.close()
-
-    # 2. Resource Usage Plot (AMÉLIORÉ)
-    print("   -> Resource Plot...")
-    res_df = monitor.get_dataframe()
-    if not res_df.empty:
-        fig, ax1 = plt.subplots(figsize=(14, 7))
-
-        ax1.set_xlabel('Time (s)')
-        ax1.set_ylabel('CPU Usage (%)', color='tab:red')
-        ax1.plot(res_df['time'], res_df['cpu'], color='tab:red', label='CPU', linewidth=1)
-        ax1.tick_params(axis='y', labelcolor='tab:red')
-        ax1.grid(True, linestyle=':', alpha=0.6)
-
-        ax2 = ax1.twinx()
-        ax2.set_ylabel('RAM Usage (MB)', color='tab:blue')
-        ax2.plot(res_df['time'], res_df['ram'], color='tab:blue', label='RAM', linewidth=1.5)
-        ax2.tick_params(axis='y', labelcolor='tab:blue')
-
-        # Ajout des lignes verticales pour les étapes
-        # On définit des couleurs de fond pour les zones
-        sorted_steps = sorted(step_starts.items(), key=lambda x: x[1])
-        colors = ['#f0f0f0', '#ffffff']  # alternance gris/blanc
-
-        for i, (step_name, start_time) in enumerate(sorted_steps):
-            ax1.axvline(x=start_time, color='black', linestyle='--', alpha=0.5)
-            # Label
-            y_pos = 105 if i % 2 == 0 else 98  # Alterner la hauteur des labels
-            ax1.text(start_time + 0.5, y_pos, step_name, rotation=0, fontsize=9, fontweight='bold',
-                     transform=ax1.get_xaxis_transform())
-
-        plt.title("System Resource Usage Pipeline Breakdown")
-        fig.tight_layout()
-        plt.savefig(os.path.join(OUTPUT_DIR, "resource_usage_annotated.png"))
-        plt.close()
-
-        max_ram = res_df['ram'].max()
-        avg_cpu = res_df['cpu'].mean()
-
-    # 3. New Graph: Time Distribution
-    print("   -> Commit Time Distribution Plot...")
-    if time_diff_data is not None:
-        # Convertir en heures pour la lisibilité
-        hours_diff = time_diff_data / 3600
+        # On s'assure que les colonnes existent
+        cols_final = [c for c in cols_to_export if c in df_errors.columns]
+
+        # 7. Tri par gravité (les pires erreurs en premier) et Export
+        df_errors_sorted = df_errors[cols_final].sort_values('error_severity', ascending=False)
+
+        filename = os.path.join(OUTPUT_DIR, "benchmark_errors.csv")
+        df_errors_sorted.to_csv(filename, index=False)
+
+        print(f"   🚨 {len(df_errors)} erreurs trouvées sur {len(df_test)} exemples.")
+        print(f"   📂 Détails sauvegardés dans : {filename}")
+        print("   -> Envoie-moi ce fichier pour l'analyse des justifications.")
+
+    def _plot_feature_importance_grouped(self):
+        fi = self.model.get_feature_importance(type="PredictionValuesChange")
+        feature_names = self.data['X_test_full'].columns
+        df_fi = pd.DataFrame({"feature": feature_names, "importance": fi})
+        pca_mask = df_fi["feature"].str.startswith("pca_")
+        pca_total_imp = df_fi.loc[pca_mask, "importance"].sum()
+        ts_mask = df_fi["feature"].str.startswith("ts_")
+        ts_total_imp = df_fi.loc[ts_mask, "importance"].sum()
+        df_grouped = df_fi[~(pca_mask | ts_mask)].copy()
+        new_rows = [
+            {"feature": "NLP: Technical Context", "importance": pca_total_imp, "type": "NLP"},
+            {"feature": "Time Series (Signals)", "importance": ts_total_imp, "type": "TS"}
+        ]
+        df_grouped["type"] = "Other"
+        df_grouped = pd.concat([df_grouped, pd.DataFrame(new_rows)], ignore_index=True)
+        df_grouped = df_grouped.sort_values("importance", ascending=False).head(15)
         plt.figure(figsize=(10, 6))
-        # Log scale sur X car distribution exponentielle
-        sns.histplot(hours_diff, log_scale=True, bins=30, color="orange", kde=True)
-        plt.xlabel("Time since last push (Hours) - Log Scale")
-        plt.title("Distribution of Time Intervals Between Commits")
-        # Ajout de lignes repères
-        plt.axvline(1, color='red', linestyle='--', alpha=0.5, label='1 Hour')
-        plt.axvline(24, color='green', linestyle='--', alpha=0.5, label='1 Day')
-        plt.axvline(168, color='blue', linestyle='--', alpha=0.5, label='1 Week')
-        plt.legend()
+        def get_color(row):
+            if row['feature'] == "NLP: Technical Context": return '#c44e52'  # Rouge
+            if row['feature'] == "Time Series (Signals)": return '#55a868'  # Vert
+            return '#4c72b0'  # Bleu
+
+        clrs = df_grouped.apply(get_color, axis=1).tolist()
+
+        sns.barplot(data=df_grouped, x="importance", y="feature", palette=clrs)
+        from matplotlib.patches import Patch
+        legend_elements = [
+            Patch(facecolor='#4c72b0', label='Metadata / Static'),
+            Patch(facecolor='#c44e52', label='NLP (Context)'),
+            Patch(facecolor='#55a868', label='Time Series (History)')
+        ]
+        plt.legend(handles=legend_elements, loc='lower right')
+        plt.title(" Feature Importance (Realistic Mode) - Grouped")
+        plt.xlabel("Importance (%)")
         plt.tight_layout()
-        plt.savefig(os.path.join(OUTPUT_DIR, "commit_time_distribution.png"))
+        plt.savefig(os.path.join(OUTPUT_DIR, "scientific_feature_importance.png"), dpi=300)
         plt.close()
 
-    # 4. Timings Report Enhanced
-    print("\n" + "=" * 40)
-    print("       BENCHMARK SUMMARY")
-    print("=" * 40)
-    total_time = sum(timings.values())
+    def _plot_pipeline_latency_waterfall(self):
+        """Barre empilée horizontale (Stacked Bar) du temps de traitement."""
+        n_commits = self.data['n_commits']
+        if n_commits == 0: n_commits = 1
 
-    for step, duration in timings.items():
-        pct = (duration / total_time) * 100
-        print(f"{step:<20}: {duration:8.4f} s ({pct:4.1f}%)")
+        label_map = {
+            "1. Loading & Feature Engineering": "Load & Eng.",
+            "2. Time Series Extraction": "Time Series",
+            "3. NLP Embeddings (Technical Context)": "NLP (Inference)",
+            "4. Prep & Splitting": "Preprocessing",
+            "6. Inference & Evaluation": "Model Inference"
+        }
 
-    print("-" * 40)
-    print(f"{'TOTAL TIME':<20}: {total_time:8.4f} s")
-    print(f"{'MAX RAM':<20}: {max_ram:8.1f} MB")
-    print(f"{'AVG CPU':<20}: {avg_cpu:8.1f} %")
-    print("=" * 40)
+        data = []
+        total_inference_time = 0
 
-    print(f"\nAll results saved in '{OUTPUT_DIR}'")
+        for full_name, short_name in label_map.items():
+            if full_name in self.timings:
+                t = self.timings[full_name]
+                data.append({"Step": short_name, "Time": t})
+                total_inference_time += t
+
+        df_time = pd.DataFrame(data)
+        df_time['Percentage'] = (df_time['Time'] / total_inference_time) * 100
+
+        fig, ax = plt.subplots(figsize=(12, 4))
+        left = 0
+        colors = sns.color_palette("husl", len(df_time))
+
+        for i, row in df_time.iterrows():
+            ax.barh(0, row['Percentage'], left=left, color=colors[i], edgecolor='white', height=0.5, label=row['Step'])
+            if row['Percentage'] > 5:
+                ax.text(left + row['Percentage'] / 2, 0, f"{row['Percentage']:.1f}%",
+                        ha='center', va='center', color='white', fontweight='bold', fontsize=10)
+            left += row['Percentage']
+
+        ax.set_yticks([])
+        ax.set_xlabel("Percentage of Total Pipeline Time")
+        ms_per_commit = (total_inference_time / n_commits) * 1000
+        ax.set_title(f" Latency Breakdown per Commit (~{ms_per_commit:.1f}ms)")
+        ax.set_xlim(0, 100)
+        ax.legend(loc='upper center', bbox_to_anchor=(0.5, -0.15), ncol=len(df_time), frameon=False)
+        plt.tight_layout()
+        plt.savefig(os.path.join(OUTPUT_DIR, "scientific_latency_breakdown.png"), dpi=300)
+        plt.close()
+
+    def _plot_pr_curve(self):
+        y_test = self.data['test']['bug_created']
+        precision, recall, _ = precision_recall_curve(y_test, self.probs)
+
+        plt.figure(figsize=(8, 6))
+        plt.plot(recall, precision, color='#2b5797', lw=2,
+                 label=f'CatBoost (AUPRC = {average_precision_score(y_test, self.probs):.2f})')
+        plt.xlabel('Recall')
+        plt.ylabel('Precision')
+        plt.title(' Precision-Recall Curve (Realistic)')
+        plt.legend(loc="lower left")
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(os.path.join(OUTPUT_DIR, "scientific_pr_curve.png"), dpi=300)
+        plt.close()
+
+    def _plot_confusion_matrix(self):
+        y_test = self.data['test']['bug_created']
+        preds = (self.probs > 0.5).astype(int)
+        cm = confusion_matrix(y_test, preds, normalize='true')
+
+        plt.figure(figsize=(6, 5))
+        sns.heatmap(cm, annot=True, fmt=".2%", cmap="Blues",
+                    xticklabels=["No Bug", "Bug"], yticklabels=["No Bug", "Bug"])
+        plt.title(" Normalized Confusion Matrix")
+        plt.ylabel("True Label")
+        plt.xlabel("Predicted Label")
+        plt.tight_layout()
+        plt.savefig(os.path.join(OUTPUT_DIR, "scientific_confusion_matrix.png"))
+        plt.close()
+
+    def _plot_prediction_distribution(self):
+        plt.figure(figsize=(8, 5))
+        df_res = pd.DataFrame({
+            "Probability": self.probs,
+            "True Label": self.data['test']['bug_created'].replace({0: "No Bug", 1: "Bug"})
+        })
+        sns.histplot(data=df_res, x="Probability", hue="True Label", bins=20, multiple="layer", alpha=0.6)
+        plt.title(" Model Confidence Distribution")
+        plt.xlabel("Predicted Probability of Bug")
+        plt.ylabel("Count")
+        plt.tight_layout()
+        plt.savefig(os.path.join(OUTPUT_DIR, "scientific_prediction_dist.png"))
+        plt.close()
 
 
 if __name__ == "__main__":
-    main()
+    pipeline = BenchmarkPipeline()
+    pipeline.run()
