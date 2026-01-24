@@ -4,32 +4,34 @@ from catboost import CatBoostClassifier
 from sklearn.metrics import average_precision_score
 from sklearn.model_selection import RepeatedStratifiedKFold
 from data_loader import load_raw_data, aggregate_alerts
-from timeseries_multi import enrich_with_ts_features
 from preprocessing import perform_time_split, enrich_and_weight_data, engineer_complex_features
 from model_utils import prepare_matrix_with_pca, make_pool
 
-# --- CONFIGURATION (SANS NLP) ---
-DB_URL = "sqlite:///optuna_icpe_no_nlp.db"
-STUDY_NAME = "catboost_no_nlp_optimization"
+# --- CONFIG STATIC ONLY ---
+DB_URL = "sqlite:///optuna_icpe_static_only.db"
+STUDY_NAME = "catboost_static_only_optimization"
 N_TRIALS = 300
 N_SPLITS = 5
 N_REPEATS = 1
 
 
-def load_and_prep_all():
-    print("--- 1. Chargement & Engineering (NO NLP) ---")
+def load_and_prep_static():
+    print("--- 1. Chargement (STATIC ONLY) ---")
     alerts, bugs = load_raw_data()
     df = aggregate_alerts(alerts)
     df = enrich_and_weight_data(df, bugs)
     df = engineer_complex_features(df)
-    df = enrich_with_ts_features(df, alerts)
-    df["bug_created"] = df["bug_created"].fillna(0).astype(int)
 
-    # On retourne None pour les embeddings
+    # ON SKIPPE LES TIME SERIES (enrich_with_ts_features)
+    # On s'assure juste d'avoir la target propre
+    if "bug_created" in df.columns:
+        df["bug_created"] = df["bug_created"].fillna(0).astype(int)
+
+    print(f"   Features disponibles (Static): {df.shape[1]}")
     return df, None
 
 
-FULL_DF, _ = load_and_prep_all()
+FULL_DF, _ = load_and_prep_static()
 TRAIN_VAL_DF, TEST_DF = perform_time_split(FULL_DF)
 print(f"Data Ready: Train+Val={len(TRAIN_VAL_DF)}, Test={len(TEST_DF)}")
 
@@ -53,7 +55,6 @@ def objective(trial):
     }
 
     if grow_policy == "Lossguide": params["max_leaves"] = trial.suggest_int("max_leaves", 16, 64)
-
     bootstrap_type = trial.suggest_categorical("bootstrap_type", ["Bayesian", "Bernoulli", "MVS"])
     params["bootstrap_type"] = bootstrap_type
 
@@ -62,26 +63,17 @@ def objective(trial):
     elif bootstrap_type in ["Bernoulli", "MVS"]:
         params["subsample"] = trial.suggest_float("subsample", 0.5, 1.0)
 
-    # Note: PAS DE PCA_COMPONENTS ICI
-
     rskf = RepeatedStratifiedKFold(n_splits=N_SPLITS, n_repeats=N_REPEATS, random_state=42)
     scores = []
 
+    # Préparation Matrix (Sans embeddings)
+    X_full, cat_cols, _ = prepare_matrix_with_pca(TRAIN_VAL_DF, embeddings=None, is_train=True, blind_mode=True)
     y_full = TRAIN_VAL_DF["bug_created"]
-    indices = np.arange(len(TRAIN_VAL_DF))
+    w_full = TRAIN_VAL_DF["sample_weight"]
 
-    # Préparation Matrix une seule fois car pas de PCA qui change
-    # Mais pour respecter la structure k-fold on le fait dans la boucle ou juste avant
-    # Ici on le fait une fois pour gagner du temps car pas de PCA
-    X_full, cat_cols, _ = prepare_matrix_with_pca(TRAIN_VAL_DF, embeddings=None, is_train=True)
-
-    for i, (train_idx, val_idx) in enumerate(rskf.split(indices, y_full)):
-        X_train = X_full.iloc[train_idx]
-        X_val = X_full.iloc[val_idx]
-        y_train = y_full.iloc[train_idx]
-        y_val = y_full.iloc[val_idx]
-        w_train = TRAIN_VAL_DF['sample_weight'].iloc[train_idx]
-        w_val = TRAIN_VAL_DF['sample_weight'].iloc[val_idx]
+    for i, (train_idx, val_idx) in enumerate(rskf.split(X_full, y_full)):
+        X_train, y_train, w_train = X_full.iloc[train_idx], y_full.iloc[train_idx], w_full.iloc[train_idx]
+        X_val, y_val, w_val = X_full.iloc[val_idx], y_full.iloc[val_idx], w_full.iloc[val_idx]
 
         train_pool = make_pool(X_train, y_train, cat_cols, w_train)
         val_pool = make_pool(X_val, y_val, cat_cols, w_val)
@@ -100,7 +92,7 @@ def objective(trial):
 
 
 if __name__ == "__main__":
-    print(f"--- Start Optuna NO NLP ---")
+    print(f"--- Start Optuna STATIC ONLY ---")
     storage = optuna.storages.RDBStorage(url=DB_URL)
     study = optuna.create_study(study_name=STUDY_NAME, storage=storage, direction="maximize", load_if_exists=True)
     study.optimize(objective, n_trials=N_TRIALS)

@@ -5,19 +5,19 @@ from sklearn.metrics import average_precision_score
 from sklearn.model_selection import RepeatedStratifiedKFold
 from data_loader import load_raw_data, aggregate_alerts
 from timeseries_multi import enrich_with_ts_features
-from preprocessing import perform_time_split, enrich_and_weight_data, engineer_complex_features
+from preprocessing import perform_time_split, enrich_and_weight_data, get_embeddings, engineer_complex_features
 from model_utils import prepare_matrix_with_pca, make_pool
 
-# --- CONFIGURATION (SANS NLP) ---
-DB_URL = "sqlite:///optuna_icpe_no_nlp.db"
-STUDY_NAME = "catboost_no_nlp_optimization"
+# --- CONFIG (AVEC NLP NOTES) ---
+DB_URL = "sqlite:///optuna_icpe_with_notes.db"
+STUDY_NAME = "catboost_with_notes_optimization"
 N_TRIALS = 300
 N_SPLITS = 5
 N_REPEATS = 1
 
 
 def load_and_prep_all():
-    print("--- 1. Chargement & Engineering (NO NLP) ---")
+    print("--- 1. Chargement & Engineering (WITH NOTES) ---")
     alerts, bugs = load_raw_data()
     df = aggregate_alerts(alerts)
     df = enrich_and_weight_data(df, bugs)
@@ -25,13 +25,19 @@ def load_and_prep_all():
     df = enrich_with_ts_features(df, alerts)
     df["bug_created"] = df["bug_created"].fillna(0).astype(int)
 
-    # On retourne None pour les embeddings
-    return df, None
+    print("--- 2. NLP Embeddings (Human Notes Only) ---")
+    # Cible les notes, pas le contexte technique
+    notes = df['alert_summary_notes'].fillna('').astype(str)
+    notes = notes.str.replace(r'\s+', ' ', regex=True).str.strip()
+    raw_embeddings = get_embeddings(notes.tolist())
+
+    return df, raw_embeddings
 
 
-FULL_DF, _ = load_and_prep_all()
+FULL_DF, RAW_EMBEDDINGS = load_and_prep_all()
 TRAIN_VAL_DF, TEST_DF = perform_time_split(FULL_DF)
-print(f"Data Ready: Train+Val={len(TRAIN_VAL_DF)}, Test={len(TEST_DF)}")
+TRAIN_VAL_EMBS = RAW_EMBEDDINGS[:len(TRAIN_VAL_DF)]
+print(f"Data Ready: Train+Val={len(TRAIN_VAL_DF)}")
 
 
 def objective(trial):
@@ -53,7 +59,6 @@ def objective(trial):
     }
 
     if grow_policy == "Lossguide": params["max_leaves"] = trial.suggest_int("max_leaves", 16, 64)
-
     bootstrap_type = trial.suggest_categorical("bootstrap_type", ["Bayesian", "Bernoulli", "MVS"])
     params["bootstrap_type"] = bootstrap_type
 
@@ -62,7 +67,8 @@ def objective(trial):
     elif bootstrap_type in ["Bernoulli", "MVS"]:
         params["subsample"] = trial.suggest_float("subsample", 0.5, 1.0)
 
-    # Note: PAS DE PCA_COMPONENTS ICI
+    # --- PARAMETRE PCA (Uniquement pour cette version) ---
+    pca_n = trial.suggest_int("pca_components", 10, 100)
 
     rskf = RepeatedStratifiedKFold(n_splits=N_SPLITS, n_repeats=N_REPEATS, random_state=42)
     scores = []
@@ -70,27 +76,32 @@ def objective(trial):
     y_full = TRAIN_VAL_DF["bug_created"]
     indices = np.arange(len(TRAIN_VAL_DF))
 
-    # Préparation Matrix une seule fois car pas de PCA qui change
-    # Mais pour respecter la structure k-fold on le fait dans la boucle ou juste avant
-    # Ici on le fait une fois pour gagner du temps car pas de PCA
-    X_full, cat_cols, _ = prepare_matrix_with_pca(TRAIN_VAL_DF, embeddings=None, is_train=True)
-
     for i, (train_idx, val_idx) in enumerate(rskf.split(indices, y_full)):
-        X_train = X_full.iloc[train_idx]
-        X_val = X_full.iloc[val_idx]
-        y_train = y_full.iloc[train_idx]
-        y_val = y_full.iloc[val_idx]
+        df_train = TRAIN_VAL_DF.iloc[train_idx]
+        df_val = TRAIN_VAL_DF.iloc[val_idx]
+
+        emb_train = TRAIN_VAL_EMBS[train_idx]
+        emb_val = TRAIN_VAL_EMBS[val_idx]
+
+        # Passage des embeddings à model_utils
+        X_train, cat_cols, pca_model = prepare_matrix_with_pca(
+            df_train, emb_train, n_components=pca_n, is_train=True
+        )
+        X_val, _, _ = prepare_matrix_with_pca(
+            df_val, emb_val, pca_model=pca_model, n_components=pca_n, is_train=False
+        )
+
         w_train = TRAIN_VAL_DF['sample_weight'].iloc[train_idx]
         w_val = TRAIN_VAL_DF['sample_weight'].iloc[val_idx]
 
-        train_pool = make_pool(X_train, y_train, cat_cols, w_train)
-        val_pool = make_pool(X_val, y_val, cat_cols, w_val)
+        train_pool = make_pool(X_train, df_train["bug_created"], cat_cols, w_train)
+        val_pool = make_pool(X_val, df_val["bug_created"], cat_cols, w_val)
 
         model = CatBoostClassifier(**params)
         model.fit(train_pool, eval_set=val_pool)
 
         preds = model.predict_proba(val_pool)[:, 1]
-        score = average_precision_score(y_val, preds)
+        score = average_precision_score(df_val["bug_created"], preds)
         scores.append(score)
 
         trial.report(np.mean(scores), i)
@@ -100,7 +111,7 @@ def objective(trial):
 
 
 if __name__ == "__main__":
-    print(f"--- Start Optuna NO NLP ---")
+    print(f"--- Start Optuna WITH NOTES ---")
     storage = optuna.storages.RDBStorage(url=DB_URL)
     study = optuna.create_study(study_name=STUDY_NAME, storage=storage, direction="maximize", load_if_exists=True)
     study.optimize(objective, n_trials=N_TRIALS)

@@ -4,34 +4,33 @@ import pandas as pd
 from contextlib import contextmanager
 from catboost import CatBoostClassifier
 from data_loader import load_raw_data, aggregate_alerts
-from timeseries_multi import enrich_with_ts_features
 from preprocessing import perform_time_split, enrich_and_weight_data, engineer_complex_features
 from model_utils import prepare_matrix_with_pca, make_pool, calculate_pr_at_k
 import matplotlib.pyplot as plt
 from sklearn.metrics import average_precision_score, precision_recall_curve, confusion_matrix
 import seaborn as sns
 
-
-OUTPUT_DIR = "benchmark_results_no_nlp"
+OUTPUT_DIR = "benchmark_results_static_only"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 BEST_PARAMS = {
+    "grow_policy": "Lossguide",
+    "learning_rate": 0.1112385704826062,
+    "depth": 4,
+    "l2_leaf_reg": 12.081551135840341,
+    "border_count": 128,
+    "min_data_in_leaf": 64,
+    "scale_pos_weight": 1.7323564185678146,
+    "one_hot_max_size": 10,
+    "max_leaves": 17,
+    "bootstrap_type": "Bernoulli",
+    "subsample": 0.9916869406073091,
     "iterations": 2000,
     "eval_metric": "AUC",
     "early_stopping_rounds": 100,
     "verbose": 100,
     "task_type": "CPU",
-    "thread_count": 4,
-    "grow_policy": "Depthwise",
-    "learning_rate": 0.04885409006852588,
-    "depth": 6,
-    "l2_leaf_reg": 0.6897929548921232,
-    "border_count": 128,
-    "min_data_in_leaf": 62,
-    "scale_pos_weight": 1.1894491861597762,
-    "one_hot_max_size": 50,
-    "bootstrap_type": "Bernoulli",
-    "subsample": 0.8197289074825262
+    "thread_count": 4
 }
 
 class BenchmarkPipeline:
@@ -47,9 +46,9 @@ class BenchmarkPipeline:
         print(f"   Done in {time.time() - t0:.2f}s")
 
     def run(self):
-        print("🚀 Benchmark [NO NLP] Started...")
+        print("🚀 Benchmark [STATIC ONLY] Started...")
         with self.log_step("1. Loading"): self._step_1_loading()
-        with self.log_step("2. Time Series"): self._step_2_timeseries()
+        with self.log_step("2. Time Series Skipped"): pass
         with self.log_step("3. NLP Skipped"): pass
         with self.log_step("4. Prep"): self._step_4_prep()
         with self.log_step("5. Train"): self._step_5_train()
@@ -61,20 +60,22 @@ class BenchmarkPipeline:
         df = aggregate_alerts(alerts)
         df = enrich_and_weight_data(df, bugs)
         df = engineer_complex_features(df)
-        self.data['df'] = df
-        self.data['alerts_raw'] = alerts
 
-    def _step_2_timeseries(self):
-        self.data['df'] = enrich_with_ts_features(self.data['df'], self.data['alerts_raw'])
-        self.data['df']["bug_created"] = self.data['df']["bug_created"].fillna(0).astype(int)
+        # On doit s'assurer que la target est propre (normalement fait dans enrich_with_ts mais on le skip)
+        if "bug_created" in df.columns:
+            df["bug_created"] = df["bug_created"].fillna(0).astype(int)
+
+        self.data['df'] = df
 
     def _step_4_prep(self):
         train_val, test = perform_time_split(self.data['df'])
-        # Pas d'embeddings passés
-        X_train, self.cat_cols, _ = prepare_matrix_with_pca(train_val, embeddings=None, is_train=True)
-        X_test, _, _ = prepare_matrix_with_pca(test, embeddings=None, is_train=False)
+        # Pas d'embeddings passés, pas de TS chargés
+        X_train, self.cat_cols, _ = prepare_matrix_with_pca(train_val, embeddings=None, is_train=True, blind_mode=True)
+        X_test, _, _ = prepare_matrix_with_pca(test, embeddings=None, is_train=False, blind_mode=True)
         self.data['train_val'], self.data['test'] = train_val, test
         self.data['X_train'], self.data['X_test'] = X_train, X_test
+
+        print(f"   Features utilisées (Static): {X_train.shape[1]}")
 
     def _step_5_train(self):
         X, y = self.data['X_train'], self.data['train_val']['bug_created']
@@ -100,28 +101,23 @@ class BenchmarkPipeline:
         print("\n--- Generating Scientific Graphs ---")
         y_test = self.data['test']['bug_created']
 
-        # 1. Grouped Feature Importance (TS vs Static)
+        # 1. Feature Importance
         fi = self.model.get_feature_importance(type="PredictionValuesChange")
         df_fi = pd.DataFrame({"feature": self.data['X_test'].columns, "importance": fi})
-        ts_mask = df_fi["feature"].str.startswith("ts_")
-        ts_total = df_fi.loc[ts_mask, "importance"].sum()
-
-        df_top = df_fi[~ts_mask].copy()
-        df_top = pd.concat([df_top, pd.DataFrame([{"feature": "Time Series Aggregated", "importance": ts_total}])],
-                           ignore_index=True)
+        df_fi.sort_values("importance", ascending=False).head(20).to_csv(f"{OUTPUT_DIR}/fi.csv")
 
         plt.figure(figsize=(10, 6))
-        sns.barplot(data=df_top.sort_values("importance", ascending=False).head(15), x="importance", y="feature",
+        sns.barplot(data=df_fi.sort_values("importance", ascending=False).head(15), x="importance", y="feature",
                     palette="viridis")
-        plt.title("Feature Importance (TS + Static)")
+        plt.title("Feature Importance (Static Blind)")
         plt.tight_layout()
-        plt.savefig(f"{OUTPUT_DIR}/feature_importance_grouped.png")
+        plt.savefig(f"{OUTPUT_DIR}/feature_importance.png")
         plt.close()
 
         # 2. PR Curve
         precision, recall, _ = precision_recall_curve(y_test, self.probs)
         plt.figure(figsize=(8, 6))
-        plt.plot(recall, precision, label=f'TS Enabled (AUPRC = {average_precision_score(y_test, self.probs):.2f})')
+        plt.plot(recall, precision, label=f'Static Blind (AUPRC = {average_precision_score(y_test, self.probs):.2f})')
         plt.xlabel('Recall')
         plt.ylabel('Precision')
         plt.title('Precision-Recall Curve')
@@ -138,17 +134,6 @@ class BenchmarkPipeline:
                     yticklabels=['No Bug', 'Bug'])
         plt.title('Normalized Confusion Matrix')
         plt.savefig(f"{OUTPUT_DIR}/confusion_matrix.png")
-        plt.close()
-
-        # 4. Sensitivity Graph (si zscore dispo)
-        plt.figure(figsize=(8, 6))
-        df_plot = self.data['test'].copy()
-        df_plot['prob'] = self.probs
-        subset = df_plot[(df_plot['rcd_ctxt_zscore'] > -5) & (df_plot['rcd_ctxt_zscore'] < 5)]
-        sns.regplot(x='rcd_ctxt_zscore', y='prob', data=subset, scatter_kws={'alpha': 0.1},
-                    line_kws={'color': 'red'})
-        plt.title('Sensitivity to Z-Score')
-        plt.savefig(f"{OUTPUT_DIR}/zscore_sensitivity.png")
         plt.close()
 
         print(f"Graphs saved to {OUTPUT_DIR}")

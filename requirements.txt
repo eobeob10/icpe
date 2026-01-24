@@ -8,3 +8,4 @@ compress-fasttext
 pyarrow
 matplotlib
 seaborn
+statsmodels

@@ -40,7 +40,13 @@ Dependencies
 Installs the required packages:
 
 ``` text 
-pip install pandas numpy matplotlib seaborn scikit-learn catboost cleanlab optuna psutil compress-fasttext tqdm pyarrow
+pip install pandas numpy matplotlib seaborn scikit-learn catboost cleanlab optuna psutil compress-fasttext tqdm pyarrow statsmodels
+```
+
+or do
+
+``` text
+pip install -r requirements.txt
 ```
 
 ## 💾 Data Layout
