@@ -1,111 +1,124 @@
-# 🚀 Performance Regression Detection Benchmark (ICPE)
+## Performance Alert Bug Prediction (ICPE 2026)
+This repository contains the source code and benchmarking pipelines for the paper "Automated Bug Prediction from Performance Alerts using Multi-Modal Learning" (Target: ICPE 2026).
 
-This project implements a **Machine Learning pipeline** designed to automate the triage of software performance alerts (Performance Regression Detection).
+The project implements a machine learning pipeline (CatBoost) to predict whether a performance regression alert in a CI/CD environment (Mozilla) will result in a valid bug report. It compares three distinct approaches:
 
-It predicts whether a performance alert triggered by CI/CD systems represents a **real software bug** or **noise** (false positive). The system operates in a strict **"Realistic Mode,"** meaning all "future" data (human notes, triage tags, manual classifications) is rigorously stripped to prevent Data Leakage, ensuring the benchmark reflects real-time decision-making capabilities.
+Static Baseline: Metadata only.
 
-## 🧠 Core Architecture
+Time Series Enhanced: Metadata + Statistical signal features (Slope, Z-Score, etc.).
 
-The model utilizes a Hybrid Architecture combining three distinct signal sources:
+Hybrid (NLP): Metadata + Time Series + Textual Embeddings (FastText) from triage notes.
 
-1.  **Multi-Scale Time Series Analysis:** Parallel extraction of statistical features (slope, z-score, step-change) over multiple window sizes (Short/Medium/Long) using `multiprocessing`.
-2.  **Contextual NLP Embeddings:** Vectorization of technical context (Repository + Framework + Test Suite names) using **FastText** (compressed) to capture semantic relationships between test suites.
-3.  **Metadata & Heuristics:** Processing of platform info, architecture (ARM/x86), and historical backfill data.
-
-The classifier is built on **CatBoost**, optimized via **Optuna**.
-
-## 📂 Project Structure
+# Project Structure
 
 ```text
-.
-├── benchmark.py           # 🏁 Main Entry Point: Runs the full pipeline (Load -> Train -> Eval -> Report)
-├── cat_boost_best.py      # 🧪 Optimization Script: Hyperparameter tuning via Optuna
-├── config.py              # ⚙️ Configuration: Path definitions and constants
-├── data_loader.py         # 📥 Data Ingestion: Loads raw CSVs and aggregates alerts
-├── model_utils.py         # 🛠️ Utilities: PCA, Data Leakage prevention, CatBoost Pool creation
-├── preprocessing.py       # 🧹 Feature Engineering: NLP (FastText), Complex String/JSON parsing
-├── timeseries_multi.py    # 📈 Time Series Engine: Parallel extraction of history signals
-└── benchmark_results/     # 📊 Output: Scientific plots, error analysis logs (Auto-generated)
+
+
+├── benchmark.py                # Main Pipeline: Static + Time Series features (No NLP)
+├── benchmark_tabular.py        # Baseline Pipeline: Static Metadata only
+├── benchmark_with_notes.py     # Hybrid Pipeline: Static + Time Series + NLP (FastText)
+│
+├── cat_boost_best.py           # Optuna Optimization for Main Pipeline
+├── cat_boost_best_with_nlp.py  # Optuna Optimization for Hybrid Pipeline
+├── cat_boost_best_static.py    # Optuna Optimization for Static Pipeline
+│
+├── data_loader.py              # Loads CSVs and aggregates raw alerts
+├── preprocessing.py            # Feature engineering, split, and FastText loading
+├── timeseries_multi.py         # Parallel extraction of Time Series features
+├── model_utils.py              # PCA, CatBoost Pool helpers, and Metrics
+├── config.py                   # Paths and global constants
+└── requirements.txt            # Python dependencies
+
 ```
 
-## 🛠️ Installation & Requirements
+# Getting Started
 Prerequisites
-Python 3.9+
 
-Internet access (required to download the compressed FastText model on the first run).
+Python 3.10+
 
-~16GB RAM recommended (for processing Time Series in parallel).
+RAM: >16GB recommended (for Time Series processing)
 
-Dependencies
-Installs the required packages:
+CPU: Multi-core recommended (pipeline uses ProcessPoolExecutor)
 
-``` text 
-pip install pandas numpy matplotlib seaborn scikit-learn catboost cleanlab optuna psutil compress-fasttext tqdm pyarrow statsmodels
+Installation
+Install the required dependencies:
+
+Bash
+```text
+pip install pandas numpy scikit-learn catboost optuna seaborn matplotlib tqdm psutil compress-fasttext pyarrow
 ```
 
-or do
+OR 
 
-``` text
+```text
 pip install -r requirements.txt
 ```
+Data Setup
+The code expects the following directory structure relative to the project root (defined in config.py):
 
-## 💾 Data Layout
-The project expects a specific directory structure relative to the code location. By default, it looks for a folder named icpe_data located two levels up from the script (see config.py).
-
-Expected Hierarchy:
-
-``` text 
-/icpe_data/                <-- Root Data Directory
-    ├── alerts_data.csv    # Raw alerts export
-    ├── bugs_data.csv      # Bug tracker export (Labels)
-    └── timeseries-data/   # Directory containing history CSVs per signature
-          ├── repo_name/
-          │    └── 123456_timeseries_data.csv
-          └── ...
 ```
 
-## 🚀 Usage
-1. Run the Standard Benchmark
-To run the full training, evaluation, and reporting pipeline:
+../icpe_data/
+    ├── alerts_data.csv       # Raw alert data
+    ├── bugs_data.csv         # Bug tracker metadata
+    └── timeseries-data/      # Folder containing per-signature .csv files
+```
+
+# Running the Benchmarks
+To reproduce the tables and figures from the paper, run the three benchmark scripts. Each script generates a specific output folder containing Precision-Recall curves, Confusion Matrices, and Feature Importance plots.
+
+1. **Static Baseline (Blind)**
+Uses only categorical and numerical metadata (e.g., platform, suite, regression type). It strictly ignores Time Series signals to serve as a naive baseline.
+
+```text
+python benchmark_tabular.py
+```
+Outputs to: benchmark_results_static_only/
+2. Time Series Pipeline (Standard)
+Enriches the static data with statistical features computed from the raw time series history (window size 5, 20, 50). This includes signal-to-noise ratio, slope changes, and step detection.
 
 ```text
 python benchmark.py
+
 ```
 
-What this does:
+Outputs to: benchmark_results_no_nlp/
+ncludes resource monitoring (RAM/CPU usage tracking)
+3. Hybrid Pipeline (With NLP)
+Adds semantic understanding by embedding triage notes using a compressed FastText model (cc.en.300.compressed.bin). PCA is applied to reduce embedding dimensionality before training.
 
-Loading: Loads and aggregates alert data.
+```text
+python benchmark_with_notes.py
 
-TS Extraction: Extracts Time Series features (cached in ./derived_features as parquet).
-
-NLP: Generates embeddings for test contexts using FastText.
-
-Training: Trains the CatBoost model.
-
-Evaluation: Calculates AUPRC, Precision@K.
-
-Analysis: Runs Cleanlab to detect potential labeling errors in the ground truth.
-
-Reporting: Exports scientific graphs and an error analysis CSV to benchmark_results/.
-
-2. Hyperparameter Optimization
-To re-optimize the CatBoost parameters using Optuna:
-
-``` text 
-python cat_boost_best.py
 ```
+Outputs to: benchmark_results_with_notes/
+# Hyperparameter Optimization
+The hyperparameters in the benchmark_\*.py files are fixed based on previous optimization runs. To re-run the optimization using Optuna, use the following scripts. These will create SQLite databases (optuna_*.db) to store trial results.
 
-Note: This utilizes SQLite for storage and runs 500 trials with Repeated Stratified K-Fold validation.
+Static Only: python cat_boost_best_static.py
 
-## 📊 Outputs & Reporting
-The benchmark.py script automatically generates a benchmark_results/ folder containing:
+Time Series: python cat_boost_best.py
 
-1. **scientific_feature_importance.png:** Grouped importance of Signals (TS) vs. Context (NLP) vs. Metadata.
+Hybrid (NLP): python cat_boost_best_with_nlp.py
 
-2. **scientific_pr_curve.png:** Precision-Recall curve.
+# Methodology & Key Features
+Weighted Loss: The model uses sample_weight derived from Bug Priority (P1/P2/P3). Critical bugs are weighted higher (x10) than minor issues to prioritize recall on severe regressions.
 
-3. **scientific_latency_breakdown.png:** Waterfall chart of pipeline latency per commit (for production feasibility analysis).
+Time Series Feature Extraction (timeseries_multi.py):
 
-4. **benchmark_errors.csv:** A detailed audit file containing the "Top Misses" (High confidence False Positives/Negatives) for manual review.
+Uses concurrent.futures to process thousands of time series files in parallel.
 
+Computes multi-scale features: delta, z-score, slope_change, std_ratio over short, medium, and long windows.
 
+Blind Mode: In the static benchmark, features that might leak the magnitude of the regression (like z-score or pct_change) are explicitly banned to ensure a fair comparison with the signal-processing approach.
+
+# Outputs
+Each benchmark generates:
+
+pr_curve.png: Precision-Recall curve with AUPRC score.
+
+feature_importance.png: Top contributing features (aggregated by type: Static vs. TS vs. NLP).
+
+confusion_matrix.png: Normalized prediction accuracy.
+
+runtime_metrics_full.csv (Only for standard benchmark): Detailed breakdown of CPU/RAM usage per stage.
