@@ -68,7 +68,6 @@ def load_timeseries_file(path_str: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 
-# x50 vs polyfit
 def fast_slope(y):
     n = len(y)
     if n < 2: return 0.0

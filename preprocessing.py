@@ -151,10 +151,6 @@ def parse_platform(val):
 
 
 def parse_backfill(val):
-    """
-    Version ROBUSTE "BULLDOZER" :
-    Cherche directement le JSON [...] dans la bouillie de caractères.
-    """
     default_res = (-1.0, -1.0, 0.0, 0)  # Mean, Std, Slope, Count
 
     if pd.isna(val):
@@ -162,7 +158,6 @@ def parse_backfill(val):
 
     s_val = str(val)
 
-    # 1. Extraction chirurgicale : on cherche la liste JSON [...]
     start = s_val.find('[')
     end = s_val.rfind(']')
 
@@ -171,28 +166,22 @@ def parse_backfill(val):
 
     json_candidate = s_val[start:end + 1]
 
-    # 2. Nettoyage des échappements toxiques (le CSV double parfois les quotes)
-    # On remplace les \" par " et les "" par "
     json_candidate = json_candidate.replace('\\"', '"').replace('""', '"')
 
     try:
         data = json.loads(json_candidate)
     except json.JSONDecodeError:
-        # Dernière chance : parfois c'est des simple quotes en Python string
         try:
             json_candidate = json_candidate.replace("'", '"')
             data = json.loads(json_candidate)
         except:
             return default_res
 
-    # 3. Validation de la structure
     if not isinstance(data, list) or len(data) < 2:
         return default_res
 
-    # 4. Extraction des points (Time Series)
     ts_points = []
     for d in data:
-        # On accepte int ou str pour la valeur, on convertit
         if isinstance(d, dict) and 'value' in d and 'push_timestamp' in d:
             try:
                 v = float(d['value'])
@@ -204,18 +193,15 @@ def parse_backfill(val):
     if len(ts_points) < 2:
         return default_res
 
-    # 5. Tri Temporel (Crucial pour la pente !)
     ts_points.sort(key=lambda x: x[0])
     values = [p[1] for p in ts_points]
     n = len(values)
 
-    # 6. Stats
     mean_val = float(np.mean(values))
     std_val = float(np.std(values))
 
-    # 7. Pente (Slope)
     try:
-        if std_val < 1e-9:  # Si c'est plat, pente = 0
+        if std_val < 1e-9:
             slope = 0.0
         else:
             slope, _, _, _, _ = linregress(range(n), values)

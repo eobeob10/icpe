@@ -8,7 +8,6 @@ from timeseries_multi import enrich_with_ts_features
 from preprocessing import perform_time_split, enrich_and_weight_data, engineer_complex_features
 from model_utils import prepare_matrix_with_pca, make_pool
 
-# --- CONFIGURATION (SANS NLP) ---
 DB_URL = "sqlite:///optuna_icpe_no_nlp.db"
 STUDY_NAME = "catboost_no_nlp_optimization"
 N_TRIALS = 300
@@ -62,7 +61,6 @@ def objective(trial):
     elif bootstrap_type in ["Bernoulli", "MVS"]:
         params["subsample"] = trial.suggest_float("subsample", 0.5, 1.0)
 
-    # Note: PAS DE PCA_COMPONENTS ICI
 
     rskf = RepeatedStratifiedKFold(n_splits=N_SPLITS, n_repeats=N_REPEATS, random_state=42)
     scores = []
@@ -70,9 +68,6 @@ def objective(trial):
     y_full = TRAIN_VAL_DF["bug_created"]
     indices = np.arange(len(TRAIN_VAL_DF))
 
-    # Préparation Matrix une seule fois car pas de PCA qui change
-    # Mais pour respecter la structure k-fold on le fait dans la boucle ou juste avant
-    # Ici on le fait une fois pour gagner du temps car pas de PCA
     X_full, cat_cols, _ = prepare_matrix_with_pca(TRAIN_VAL_DF, embeddings=None, is_train=True)
 
     for i, (train_idx, val_idx) in enumerate(rskf.split(indices, y_full)):

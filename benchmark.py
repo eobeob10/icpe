@@ -37,7 +37,6 @@ BEST_PARAMS = {
 }
 
 
-# --- CLASSE DE MONITORING INTELLIGENTE (Gère Multi-Process) ---
 class ResourceMonitor(threading.Thread):
     def __init__(self, interval=0.1):
         super().__init__()
@@ -48,32 +47,27 @@ class ResourceMonitor(threading.Thread):
         self.process = psutil.Process(os.getpid())
 
     def run(self):
-        # Init CPU counter
         self.process.cpu_percent()
         while not self.stop_event.is_set():
             try:
-                # 1. Liste du processus principal + tous les enfants (workers du Pool)
                 children = self.process.children(recursive=True)
                 all_procs = [self.process] + children
 
-                # 2. Somme de la RAM (RSS)
                 total_ram = 0
                 total_cpu = 0.0
 
                 for p in all_procs:
                     try:
-                        # rss en MB
                         total_ram += p.memory_info().rss / (1024 * 1024)
-                        # cpu_percent (interval=None est non-bloquant)
                         total_cpu += p.cpu_percent(interval=None)
                     except (psutil.NoSuchProcess, psutil.AccessDenied):
-                        pass  # Le processus est mort entre temps, on ignore
+                        pass
 
                 self.cpu_readings.append(total_cpu)
                 self.ram_readings.append(total_ram)
 
             except Exception:
-                pass  # Sécurité pour ne pas crasher le benchmark
+                pass
 
             time.sleep(self.interval)
 
@@ -84,7 +78,6 @@ class ResourceMonitor(threading.Thread):
     def get_stats(self):
         if not self.ram_readings:
             return 0.0, 0.0
-        # On prend le Max RAM atteint et la Moyenne CPU
         peak_ram = max(self.ram_readings)
         avg_cpu = sum(self.cpu_readings) / len(self.cpu_readings)
         return peak_ram, avg_cpu
@@ -99,7 +92,7 @@ class BenchmarkPipeline:
     @contextmanager
     def log_step(self, name):
         print(f"\n[Step] {name}...")
-        monitor = ResourceMonitor(interval=0.2)  # Intervalle un peu plus long pour laisser respirer le CPU
+        monitor = ResourceMonitor(interval=0.2)
         monitor.start()
         t0 = time.time()
 
@@ -122,7 +115,7 @@ class BenchmarkPipeline:
         if ts_cache.exists():
             print(f"WARNING THERE IS A CACHE FILE, RESOURCES METRICS COULD BE CORRUPTED")
 
-        print("🚀 Benchmark [NO NLP] Started...")
+        print("Benchmark no nlp Started...")
 
         with self.log_step("Load data"):
             self._step_1_loading()
@@ -151,8 +144,6 @@ class BenchmarkPipeline:
         print("=" * 60)
         df_stats = pd.DataFrame(self.metrics_history)
 
-        # Le "Total" RAM n'est pas une somme mais le MAX observé globalement (approx)
-        # Le "Total" Time est la somme
         total_row = {
             "Stage": "Total Pipeline",
             "Time (s)": df_stats["Time (s)"].sum(),
@@ -174,7 +165,6 @@ class BenchmarkPipeline:
         self.data['alerts_raw'] = alerts
 
     def _step_2_timeseries(self):
-        # Cette fonction lance des ProcessPoolExecutor, le nouveau Monitor va les voir !
         self.data['df'] = enrich_with_ts_features(self.data['df'], self.data['alerts_raw'])
         self.data['df']["bug_created"] = self.data['df']["bug_created"].fillna(0).astype(int)
 
@@ -198,13 +188,13 @@ class BenchmarkPipeline:
         test_pool = make_pool(self.data['X_test'], None, self.cat_cols)
         self.probs = self.model.predict_proba(test_pool)[:, 1]
         y_test = self.data['test']['bug_created']
-        print(f"   🏆 AUPRC: {average_precision_score(y_test, self.probs):.4f}")
+        print(f"   AUPRC: {average_precision_score(y_test, self.probs):.4f}")
         for k in [50, 100, 200]:
             p, r = calculate_pr_at_k(y_test, self.probs, k)
             print(f"P@{k:<4} | {p:.4f}  R@{k:<4} | {r:.4f}")
 
     def _step_8_reporting(self):
-        print("\n--- Generating Scientific Graphs ---")
+        print("\n--- Generating Graphs ---")
         y_test = self.data['test']['bug_created']
 
         fi = self.model.get_feature_importance(type="PredictionValuesChange")

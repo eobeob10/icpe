@@ -85,7 +85,6 @@ class BenchmarkPipeline:
 
         pca_n = BEST_PARAMS["pca_components"]
 
-        # Passage des embeddings (Le PCA sera activé par model_utils)
         X_train, self.cat_cols, self.pca_model = prepare_matrix_with_pca(
             train_val, emb_train, n_components=pca_n, is_train=True
         )
@@ -104,7 +103,6 @@ class BenchmarkPipeline:
         train_pool = make_pool(X.iloc[:split], y.iloc[:split], self.cat_cols, w.iloc[:split])
         val_pool = make_pool(X.iloc[split:], y.iloc[split:], self.cat_cols, w.iloc[split:])
 
-        # Nettoyage params
         params = BEST_PARAMS.copy()
         if 'pca_components' in params: del params['pca_components']
 
@@ -124,7 +122,6 @@ class BenchmarkPipeline:
         print("\n--- Generating Scientific Graphs ---")
         y_test = self.data['test']['bug_created']
 
-        # 1. Feature Importance (NLP vs TS vs Static)
         fi = self.model.get_feature_importance(type="PredictionValuesChange")
         df_fi = pd.DataFrame({"feature": self.data['X_test'].columns, "importance": fi})
 
@@ -149,7 +146,6 @@ class BenchmarkPipeline:
         plt.savefig(f"{OUTPUT_DIR}/feature_importance_hybrid.png")
         plt.close()
 
-        # 2. PR Curve
         precision, recall, _ = precision_recall_curve(y_test, self.probs)
         plt.figure(figsize=(8, 6))
         plt.plot(recall, precision, label=f'Hybrid (AUPRC = {average_precision_score(y_test, self.probs):.2f})')
@@ -161,7 +157,6 @@ class BenchmarkPipeline:
         plt.savefig(f"{OUTPUT_DIR}/pr_curve.png")
         plt.close()
 
-        # 3. Confusion Matrix
         y_pred = (self.probs > 0.5).astype(int)
         cm = confusion_matrix(y_test, y_pred, normalize='true')
         plt.figure(figsize=(6, 5))

@@ -8,7 +8,6 @@ from timeseries_multi import enrich_with_ts_features
 from preprocessing import perform_time_split, enrich_and_weight_data, get_embeddings, engineer_complex_features
 from model_utils import prepare_matrix_with_pca, make_pool
 
-# --- CONFIG (AVEC NLP NOTES) ---
 DB_URL = "sqlite:///optuna_icpe_with_notes.db"
 STUDY_NAME = "catboost_with_notes_optimization"
 N_TRIALS = 300
@@ -26,7 +25,6 @@ def load_and_prep_all():
     df["bug_created"] = df["bug_created"].fillna(0).astype(int)
 
     print("--- 2. NLP Embeddings (Human Notes Only) ---")
-    # Cible les notes, pas le contexte technique
     notes = df['alert_summary_notes'].fillna('').astype(str)
     notes = notes.str.replace(r'\s+', ' ', regex=True).str.strip()
     raw_embeddings = get_embeddings(notes.tolist())
@@ -67,7 +65,6 @@ def objective(trial):
     elif bootstrap_type in ["Bernoulli", "MVS"]:
         params["subsample"] = trial.suggest_float("subsample", 0.5, 1.0)
 
-    # --- PARAMETRE PCA (Uniquement pour cette version) ---
     pca_n = trial.suggest_int("pca_components", 10, 100)
 
     rskf = RepeatedStratifiedKFold(n_splits=N_SPLITS, n_repeats=N_REPEATS, random_state=42)
@@ -83,7 +80,6 @@ def objective(trial):
         emb_train = TRAIN_VAL_EMBS[train_idx]
         emb_val = TRAIN_VAL_EMBS[val_idx]
 
-        # Passage des embeddings à model_utils
         X_train, cat_cols, pca_model = prepare_matrix_with_pca(
             df_train, emb_train, n_components=pca_n, is_train=True
         )

@@ -7,7 +7,6 @@ from data_loader import load_raw_data, aggregate_alerts
 from preprocessing import perform_time_split, enrich_and_weight_data, engineer_complex_features
 from model_utils import prepare_matrix_with_pca, make_pool
 
-# --- CONFIG STATIC ONLY ---
 DB_URL = "sqlite:///optuna_icpe_static_only.db"
 STUDY_NAME = "catboost_static_only_optimization"
 N_TRIALS = 300
@@ -22,8 +21,6 @@ def load_and_prep_static():
     df = enrich_and_weight_data(df, bugs)
     df = engineer_complex_features(df)
 
-    # ON SKIPPE LES TIME SERIES (enrich_with_ts_features)
-    # On s'assure juste d'avoir la target propre
     if "bug_created" in df.columns:
         df["bug_created"] = df["bug_created"].fillna(0).astype(int)
 
@@ -66,7 +63,6 @@ def objective(trial):
     rskf = RepeatedStratifiedKFold(n_splits=N_SPLITS, n_repeats=N_REPEATS, random_state=42)
     scores = []
 
-    # Préparation Matrix (Sans embeddings)
     X_full, cat_cols, _ = prepare_matrix_with_pca(TRAIN_VAL_DF, embeddings=None, is_train=True, blind_mode=True)
     y_full = TRAIN_VAL_DF["bug_created"]
     w_full = TRAIN_VAL_DF["sample_weight"]

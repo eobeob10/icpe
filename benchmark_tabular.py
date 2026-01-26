@@ -61,7 +61,6 @@ class BenchmarkPipeline:
         df = enrich_and_weight_data(df, bugs)
         df = engineer_complex_features(df)
 
-        # On doit s'assurer que la target est propre (normalement fait dans enrich_with_ts mais on le skip)
         if "bug_created" in df.columns:
             df["bug_created"] = df["bug_created"].fillna(0).astype(int)
 
@@ -69,7 +68,6 @@ class BenchmarkPipeline:
 
     def _step_4_prep(self):
         train_val, test = perform_time_split(self.data['df'])
-        # Pas d'embeddings passés, pas de TS chargés
         X_train, self.cat_cols, _ = prepare_matrix_with_pca(train_val, embeddings=None, is_train=True, blind_mode=True)
         X_test, _, _ = prepare_matrix_with_pca(test, embeddings=None, is_train=False, blind_mode=True)
         self.data['train_val'], self.data['test'] = train_val, test
@@ -92,7 +90,7 @@ class BenchmarkPipeline:
         test_pool = make_pool(self.data['X_test'], None, self.cat_cols)
         self.probs = self.model.predict_proba(test_pool)[:, 1]
         y_test = self.data['test']['bug_created']
-        print(f"   🏆 AUPRC: {average_precision_score(y_test, self.probs):.4f}")
+        print(f"   AUPRC: {average_precision_score(y_test, self.probs):.4f}")
         for k in [50, 100, 200]:
             p, r = calculate_pr_at_k(y_test, self.probs, k)
             print(f"P@{k:<4} | {p:.4f}  R@{k:<4} | {r:.4f}")
@@ -101,7 +99,6 @@ class BenchmarkPipeline:
         print("\n--- Generating Scientific Graphs ---")
         y_test = self.data['test']['bug_created']
 
-        # 1. Feature Importance
         fi = self.model.get_feature_importance(type="PredictionValuesChange")
         df_fi = pd.DataFrame({"feature": self.data['X_test'].columns, "importance": fi})
         df_fi.sort_values("importance", ascending=False).head(20).to_csv(f"{OUTPUT_DIR}/fi.csv")
@@ -114,7 +111,6 @@ class BenchmarkPipeline:
         plt.savefig(f"{OUTPUT_DIR}/feature_importance.png")
         plt.close()
 
-        # 2. PR Curve
         precision, recall, _ = precision_recall_curve(y_test, self.probs)
         plt.figure(figsize=(8, 6))
         plt.plot(recall, precision, label=f'Static Blind (AUPRC = {average_precision_score(y_test, self.probs):.2f})')
@@ -126,7 +122,6 @@ class BenchmarkPipeline:
         plt.savefig(f"{OUTPUT_DIR}/pr_curve.png")
         plt.close()
 
-        # 3. Confusion Matrix
         y_pred = (self.probs > 0.5).astype(int)
         cm = confusion_matrix(y_test, y_pred, normalize='true')
         plt.figure(figsize=(6, 5))
