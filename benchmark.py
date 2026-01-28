@@ -45,28 +45,43 @@ class ResourceMonitor(threading.Thread):
         self.cpu_readings = []
         self.ram_readings = []
         self.process = psutil.Process(os.getpid())
+        self.procs_cache = {self.process.pid: self.process}
 
     def run(self):
         self.process.cpu_percent()
+
         while not self.stop_event.is_set():
             try:
-                children = self.process.children(recursive=True)
-                all_procs = [self.process] + children
+                current_children = self.process.children(recursive=True)
+                current_pids = {p.pid for p in current_children}
+
+                for p in current_children:
+                    if p.pid not in self.procs_cache:
+                        self.procs_cache[p.pid] = p
+                        # Premier appel pour initialiser le compteur de ce nouveau worker
+                        try:
+                            p.cpu_percent()
+                        except:
+                            pass
+
+                self.procs_cache = {pid: proc for pid, proc in self.procs_cache.items()
+                                    if pid == self.process.pid or pid in current_pids}
 
                 total_ram = 0
                 total_cpu = 0.0
 
-                for p in all_procs:
+                for pid, p in self.procs_cache.items():
                     try:
-                        total_ram += p.memory_info().rss / (1024 * 1024)
-                        total_cpu += p.cpu_percent(interval=None)
-                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        if psutil.pid_exists(pid):
+                            total_ram += p.memory_info().rss / (1024 * 1024)
+                            total_cpu += p.cpu_percent(interval=None)
+                    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                         pass
 
                 self.cpu_readings.append(total_cpu)
                 self.ram_readings.append(total_ram)
 
-            except Exception:
+            except Exception as e:
                 pass
 
             time.sleep(self.interval)
@@ -207,7 +222,7 @@ class BenchmarkPipeline:
 
         plt.figure(figsize=(10, 6))
         sns.barplot(data=df_top.sort_values("importance", ascending=False).head(15), x="importance", y="feature",
-                    palette="viridis")
+                    palette="Greys_r")
         plt.title("Feature Importance (TS + Static)")
         plt.tight_layout()
         plt.savefig(f"{OUTPUT_DIR}/feature_importance_grouped.png")
