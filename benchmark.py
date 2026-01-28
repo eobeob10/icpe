@@ -58,7 +58,6 @@ class ResourceMonitor(threading.Thread):
                 for p in current_children:
                     if p.pid not in self.procs_cache:
                         self.procs_cache[p.pid] = p
-                        # Premier appel pour initialiser le compteur de ce nouveau worker
                         try:
                             p.cpu_percent()
                         except:
